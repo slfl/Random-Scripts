@@ -1,0 +1,129 @@
+;;;;RPID;;RSVER;;RHVER;;RMODE;;RPGHEAD;RCBM;BD:9,8,40910825;BD:9;;BD:100,20,0;;BD:33;BD:33,0,0,0,1;;LED255,255,255; - powerON
+
+
+BD:31,0; - рестарт платы моторов
+BD:31,1; - полный рестарт системы
+
+BD:100,0; - stop
+BD:100,1; - left motor
+BD:100,2; - right motor
+BD:100,3; - up motor
+BD:100,4; - down motor
+
+BD:100,8; - cut square?
+BD:100,101; - sample cut 1
+BD:100,102; - sample cut 2
+BD:100,103; - sample cut 3
+BD:100,104; - sample cut 4
+BD:100,105; - sample cut 5
+BD:100,106; - set RGB - 42443A3130302C3130363B
+
+
+BD:100,20,0; - ???
+
+1212 - update cutter + apk
+1313 - update apk
+1414 - cutter
+1515
+2323 - service mode?
+
+
+CBM=DX101070421155327;
+
+my
+JBVV1KGU8J
+
+other
+XOD5UDGUWE
+
+___________________________________
+
+RCMD=10,0; - По идее, сброс после кнопки включения.
+
+
+
+
+
+AT+BAUD=5.. - 4800
+
+
+RCMD=10,0;
+PID=F685-5C15-1577-B857;
+SVER=V23.0728;
+HVER=V9.0810;
+MODE=CUT_A;
+PGHEAD=PGCUTA;
+CBM=DX101070421155327;
+RCMD=9,8,3657757298;
+URL=http://www.cutabc.cn:8091;
+COMPNO=87550025;
+RCMD=100,20,215;
+RCMD=33,7,1,180,120;
+RCMD=33,7,2,190,120;
+RCMD=33,7,3,190,200;
+RCMD=33,7,4,200,300;
+RCMD=33,7,5,210,297;
+RCMD=33,7,6,210,410;
+RCMD=33,7,7,225,320;
+RCMD=33,0,1,800,800;
+
+ERR=0;
+BLU=;
+PGHEAD=PGCUTA;
+PID=F685-5C15-1577-B857;
+SVER=V23.0728;
+HVER=V9.0810;
+BSVER=20211129;
+MID=AEC3A9108D4EAA67;
+OK=RINFO;
+
+
+
+
+___________________________________
+Обнова... Androd > cutter
+PGCUTA=0;HEADLEN=0069;DATLEN=113507;CHECKSUM=009c1d78;HDSUM=f577effb;
+PGCUTA=0;HEADLEN=0069;DATLEN=113507;CHECKSUM=009c1d78;HDSUM=f577effb;
+PGCUTA=0;HEADLEN=0069;DATLEN=113507;CHECKSUM=009c1d78;HDSUM=f577effb;
+PGCUTA=0;HEADLEN=0069;DATLEN=113507;CHECKSUM=009c1d78;HDSUM=f577effb;
+PGCUTA=0;HEADLEN=0069;DATLEN=113507;CHECKSUM=009c1d78;HDSUM=f577effb;
+PGCUTA=0;HEADLEN=0069;DATLEN=113507;CHECKSUM=009c1d78;H...
+
+После обновы ответ... cutter > android
+;;PGOK;aAT+BAUD=5\r\nAT+BAUD=5\r\nAT+BAUD=5\r\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\xE0!\xE0!\xE0\xE0\xE0\xE0\xE0\xE0!!!\xE0\xE0!\xE0\xE0\xE0\xE0\xE0\xE0!!\xE0\xE0\xE0!\xE0\xE0\xE0!\xE0\xE0!!\xE0!\xE0!\xE0!\xE0\xE0\xE0\xE0\xE0\xE0!!!\xE0\xE0!\xE0\xE0\xE0\xE0\xE0\xE0!!\xE0\xE0\xE0!\xE0\xE0\xE0!\xE0\xE0!!\xE0!\xE0!\xE0!\xE0\xE0\xE0\xE0\xE0\xE0!!!\xE0\xE0!\xE0\xE0\xE0\xE0\xE0\xE0!!\xE0\xE0\xE0!\xE0\xE0\xE0!\xE0\xE0!!\xE0!!!\x1C!\x1C\xE0!!!!\x1C\x1C\0\0!\xFC\xE0\x1C!\x1C!!!!!\x1C!\x1C\xE0!!!!\x1C\x1C\0\0!\xFC\xE0\x1C!\x1C!!!!!\x1C!\x1C\xE0!!!!\x1C\x1C\0\0!\xFC\xE0\x1C!\x1C!!!!!!\x9E\x86!\x9E!\x9E!!!\xE6!\xE6!!\x98\x80!!!\x9E\x86!\x9E!\x9E!!!\xE6!\xE6!!\x98\x80!!!\x9E\x86!\x9E!\x9E!!!\xE6!\xE6!!\x98\x80
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
