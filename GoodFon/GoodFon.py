@@ -56,6 +56,8 @@ SECTION_BASE_URL = f"https://www.goodfon.com/{THEME}/"
 LOGIN_URL        = "https://www.goodfon.com/auth/signin/"
 USER_AGENT       = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+
+DOWNLOAD_LIMIT_MARKER = "исчерпали возможное количество скачанных"
 # =====================
 
 logging.basicConfig(
@@ -248,6 +250,15 @@ def find_download_href_on_image_page(session: requests.Session, image_page_url: 
             rr = session.get(download_page_url, headers={"Referer": image_page_url}, timeout=15)
             if rr.status_code != 200:
                 return None
+
+            # Принудительно указываем кодировку чтобы корректно читать русский текст
+            rr.encoding = rr.apparent_encoding or "utf-8"
+
+            # Проверяем превышение суточного лимита
+            if DOWNLOAD_LIMIT_MARKER in rr.text or "download_limit" in rr.text:
+                log.warning("Превышен суточный лимит скачиваний на сайте.")
+                raise DownloadLimitReachedError()
+
             soup2 = BeautifulSoup(rr.text, "html.parser")
             img = soup2.find("img", src=True)
             if img and "img.goodfon.com" in img["src"]:
@@ -347,6 +358,34 @@ def add_to_like(session: requests.Session):
         log.warning("Не найден элемент для добавления в избранное на странице.")
 
 
+# ====== Исключение: лимит скачиваний ======
+
+class DownloadLimitReachedError(Exception):
+    """Превышен суточный лимит скачиваний на сайте."""
+
+
+# ====== Локальный fallback ======
+
+def fallback_local(like_only: bool = False):
+    """Устанавливает случайную картинку из локальной папки.
+    Если like_only=True — берёт только из папки Like."""
+    if like_only:
+        local_files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
+    else:
+        local_files = [f for f in glob.glob(os.path.join(SAVE_DIR, "*.*")) if os.path.isfile(f)]
+        if not local_files:
+            local_files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
+
+    if local_files:
+        chosen = random.choice(local_files)
+        log.info("Fallback: устанавливаем локальную картинку: %s", chosen)
+        set_wallpaper(chosen)
+        notify("Обои обновлены 📁", f"Локально: {os.path.basename(chosen)}")
+    else:
+        log.warning("Fallback: локальных картинок нет, обои не изменены.")
+        notify("GoodFon: ошибка 😞", "Нет доступных картинок.")
+
+
 # ====== Основной запуск ======
 
 def main():
@@ -417,24 +456,17 @@ def main():
             notify("Обои обновлены 🖼️", f"С сайта: {os.path.basename(saved_path)}")
             return
 
+        except DownloadLimitReachedError:
+            log.warning("Суточный лимит скачиваний исчерпан, переходим на локальные картинки.")
+            notify("GoodFon: лимит исчерпан ⚠️", "Суточный лимит исчерпан. Загружаем из избранного.")
+            fallback_local(like_only=True)
+            return
+
         except Exception as e:
             log.error("Ошибка при попытке %d: %s", attempt, e)
 
     log.error("Не удалось найти и скачать изображение после %d попыток.", MAX_ATTEMPTS)
-
-    # Fallback: берём случайную картинку из локальной папки
-    local_files = [f for f in glob.glob(os.path.join(SAVE_DIR, "*.*")) if os.path.isfile(f)]
-    if not local_files:
-        local_files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
-
-    if local_files:
-        chosen = random.choice(local_files)
-        log.info("Fallback: устанавливаем локальную картинку: %s", chosen)
-        set_wallpaper(chosen)
-        notify("Обои обновлены 📁", f"Локально (сайт недоступен): {os.path.basename(chosen)}")
-    else:
-        log.warning("Fallback: локальных картинок нет, обои не изменены.")
-        notify("GoodFon: ошибка 😞", "Сайт недоступен и локальных картинок нет.")
+    fallback_local()
 
 
 if __name__ == "__main__":
