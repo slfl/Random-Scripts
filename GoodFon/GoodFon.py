@@ -244,33 +244,44 @@ def find_download_href_on_image_page(session: requests.Session, image_page_url: 
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    for a in soup.find_all("a", href=True):
-        if f"wallpaper-download-{RESOLUTION}" in a["href"]:
-            download_page_url = urljoin(image_page_url, a["href"])
-            rr = session.get(download_page_url, headers={"Referer": image_page_url}, timeout=15)
-            if rr.status_code != 200:
-                return None
+    # Ищем ссылку строго с нужным разрешением в блоке скачивания
+    download_div = soup.find("div", class_="wallpaper__download")
+    if not download_div:
+        log.warning("Блок скачивания не найден на странице: %s", image_page_url)
+        return None
 
-            # Принудительно указываем кодировку чтобы корректно читать русский текст
-            rr.encoding = rr.apparent_encoding or "utf-8"
+    target_href = None
+    for a in download_div.find_all("a", href=True):
+        if f"wallpaper-download-{RESOLUTION}-" in a["href"]:
+            target_href = a["href"]
+            break
 
-            # Проверяем превышение суточного лимита
-            if DOWNLOAD_LIMIT_MARKER in rr.text or "download_limit" in rr.text:
-                log.warning("Превышен суточный лимит скачиваний на сайте.")
-                raise DownloadLimitReachedError()
+    if not target_href:
+        log.info("Разрешение %s недоступно для этой картинки, пропускаем.", RESOLUTION)
+        return None
 
-            soup2 = BeautifulSoup(rr.text, "html.parser")
-            img = soup2.find("img", src=True)
-            if img and "img.goodfon.com" in img["src"]:
-                return urljoin(download_page_url, img["src"])
+    # Переходим на страницу загрузки
+    download_page_url = urljoin(image_page_url, target_href)
+    rr = session.get(download_page_url, headers={"Referer": image_page_url}, timeout=15)
+    if rr.status_code != 200:
+        return None
 
-    # Fallback: прямая картинка на странице
-    available = [a["href"] for a in soup.find_all("a", href=True) if "wallpaper-download-" in a["href"]]
-    if available:
-        log.warning("Разрешение %s не найдено. Доступные: %s", RESOLUTION, available)
+    # Принудительно указываем кодировку чтобы корректно читать русский текст
+    rr.encoding = rr.apparent_encoding or "utf-8"
 
-    img = soup.find("img", src=True)
-    return urljoin(image_page_url, img["src"]) if img and "img.goodfon.com" in img["src"] else None
+    # Проверяем превышение суточного лимита
+    if DOWNLOAD_LIMIT_MARKER in rr.text or "download_limit" in rr.text:
+        log.warning("Превышен суточный лимит скачиваний на сайте.")
+        raise DownloadLimitReachedError()
+
+    # Ищем ссылку на картинку
+    soup2 = BeautifulSoup(rr.text, "html.parser")
+    img = soup2.find("img", src=True)
+    if img and "img.goodfon" in img["src"]:
+        return urljoin(download_page_url, img["src"])
+
+    log.warning("Ссылка на картинку не найдена на странице загрузки: %s", download_page_url)
+    return None
 
 def download_final_image(session: requests.Session, final_url: str) -> Optional[bytes]:
     r = session.get(final_url, headers={"User-Agent": USER_AGENT}, allow_redirects=True, timeout=20)
