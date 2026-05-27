@@ -51,7 +51,7 @@ LIKE_EVERY_N   = get_config_int("settings", "like_every_n", fallback=10)
 MAX_ATTEMPTS   = get_config_int("settings", "max_attempts", fallback=3)
 NOTIFY         = config["settings"].getboolean("notify", fallback=True)
 
-LIKE_DIR         = os.path.join(SAVE_DIR, "Like")
+LIKE_DIR         = os.path.join(SAVE_DIR, "Like", THEME)
 SECTION_BASE_URL = f"https://www.goodfon.com/{THEME}/"
 LOGIN_URL        = "https://www.goodfon.com/auth/signin/"
 USER_AGENT       = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -322,20 +322,48 @@ def get_last_downloaded_file() -> Optional[str]:
     )
     return files[-1] if files else None
 
+def get_current_wallpaper_path() -> Optional[str]:
+    """Возвращает путь к текущим обоям из реестра Windows."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Control Panel\Desktop")
+        path, _ = winreg.QueryValueEx(key, "Wallpaper")
+        winreg.CloseKey(key)
+        return path if path else None
+    except Exception as e:
+        log.warning("Не удалось прочитать текущие обои из реестра: %s", e)
+        return None
+
 def set_wallpaper_from_like() -> bool:
-    """Выбирает случайную картинку из папки Like и устанавливает её фоном.
-    Возвращает True при успехе, False если папка пуста."""
+    """Выбирает случайную картинку из папки Like/THEME и устанавливает её фоном."""
     files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
     if not files:
-        log.warning("Папка Like пуста, загружаем с сайта")
+        log.warning("Папка Like/%s пуста, загружаем с сайта", THEME)
         return False
     chosen = random.choice(files)
     set_wallpaper(chosen)
-    log.info("Обои из папки Like: %s", chosen)
+    log.info("Обои из папки Like/%s: %s", THEME, chosen)
     notify("Обои обновлены ❤️", f"Из папки Like: {os.path.basename(chosen)}")
     return True
 
+def get_favorite_ids(session: requests.Session, image_page_url: str):
+    """Возвращает (add_url, del_url) из блока избранного на странице картинки."""
+    r = session.get(image_page_url, timeout=15)
+    if r.status_code != 200:
+        log.warning("Не удалось открыть страницу картинки: %s", image_page_url)
+        return None, None
+    soup = BeautifulSoup(r.text, "html.parser")
+    fav = soup.find("a", {"class": "js-favorite"})
+    if not fav:
+        log.warning("Блок избранного не найден на странице: %s", image_page_url)
+        return None, None
+    add_url = fav.get("data-add")
+    del_url = fav.get("data-del")
+    return add_url, del_url
+
 def add_to_like(session: requests.Session):
+    """Добавляет текущую картинку в Like/THEME и в избранное на сайте."""
     last_file = get_last_downloaded_file()
     if not last_file:
         log.error("Нет последнего скачанного файла.")
@@ -348,25 +376,68 @@ def add_to_like(session: requests.Session):
     dest_path = os.path.join(LIKE_DIR, filename)
     if not os.path.exists(dest_path):
         shutil.copy2(last_file, dest_path)
-        log.info("Изображение скопировано в папку Like: %s", dest_path)
+        log.info("Изображение скопировано в папку Like/%s: %s", THEME, dest_path)
+    else:
+        log.info("Изображение уже есть в папке Like/%s", THEME)
+
+    # Переставляем обои на копию из Like/THEME чтобы unlike работал корректно
+    set_wallpaper(dest_path)
+    log.info("Обои переключены на копию из Like/%s", THEME)
 
     image_page_url = f"https://www.goodfon.com/{THEME}/wallpaper-{name_only}.html"
-    r = session.get(image_page_url, timeout=15)
-    if r.status_code != 200:
-        log.warning("Не удалось открыть страницу для добавления в избранное: %s", image_page_url)
-        return
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    fav = soup.find("a", {"class": "wallpaper__favorite"})
-    if fav and fav.get("data-add"):
-        add_url = urljoin("https://www.goodfon.com", fav["data-add"])
-        rr = session.get(add_url, headers={"Referer": image_page_url}, timeout=15)
-        if rr.status_code == 200:
+    add_url, _ = get_favorite_ids(session, image_page_url)
+    if add_url:
+        r = session.get(urljoin("https://www.goodfon.com", add_url),
+                        headers={"Referer": image_page_url}, timeout=15)
+        if r.status_code == 200:
             log.info("Изображение добавлено в избранное на сайте: %s", filename)
+            notify("Добавлено в избранное ❤️", filename)
         else:
-            log.warning("Ошибка добавления в избранное: статус %s", rr.status_code)
+            log.warning("Ошибка добавления в избранное: статус %s", r.status_code)
     else:
         log.warning("Не найден элемент для добавления в избранное на странице.")
+
+def remove_from_like(session: requests.Session):
+    """Удаляет текущую картинку из Like/THEME и из избранного на сайте,
+    затем загружает новую картинку с сайта."""
+    current = get_current_wallpaper_path()
+    if not current:
+        log.error("Не удалось определить текущие обои.")
+        return False
+
+    # Проверяем что текущие обои находятся в папке Like/THEME
+    if not current.lower().startswith(LIKE_DIR.lower()):
+        log.error("Текущие обои не из папки Like/%s: %s", THEME, current)
+        log.error("Unlike работает только когда установлена картинка из избранного.")
+        notify("GoodFon: ошибка 😞", "Текущие обои не из папки избранного.")
+        return False
+
+    filename = os.path.basename(current)
+    name_only = os.path.splitext(filename)[0]
+    log.info("Удаляем из избранного: %s", filename)
+
+    image_page_url = f"https://www.goodfon.com/{THEME}/wallpaper-{name_only}.html"
+    _, del_url = get_favorite_ids(session, image_page_url)
+    if del_url:
+        r = session.get(urljoin("https://www.goodfon.com", del_url),
+                        headers={"Referer": image_page_url}, timeout=15)
+        if r.status_code == 200:
+            log.info("Изображение удалено из избранного на сайте: %s", filename)
+        else:
+            log.warning("Ошибка удаления из избранного: статус %s", r.status_code)
+    else:
+        log.warning("Не найден элемент для удаления из избранного на странице.")
+
+    # Удаляем локальный файл
+    try:
+        os.remove(current)
+        log.info("Файл удалён из папки Like/%s: %s", THEME, filename)
+        notify("Удалено из избранного 🗑️", filename)
+    except Exception as e:
+        log.error("Не удалось удалить файл %s: %s", current, e)
+        return False
+
+    return True
 
 
 # ====== Исключение: лимит скачиваний ======
@@ -411,6 +482,12 @@ def main():
     if arg == "like":
         add_to_like(session)
         return
+
+    if arg == "unlike":
+        if remove_from_like(session):
+            log.info("Загружаем новую картинку с сайта после удаления из избранного.")
+        else:
+            return
 
     # Счётчик: каждый LIKE_EVERY_N-й запуск берём картинку из Like
     counter = read_counter() + 1
