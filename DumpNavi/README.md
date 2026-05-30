@@ -44,28 +44,35 @@ columns. The title bar shows `*` while there are unsaved changes.
 * For **compressed** entries (marked `C` in `list`): `CECompressv4.dll`
   (shipped here), Microsoft's `compress_lzx` codec.
 
-### ⚠️ Compressed entries need 32-bit Python on Windows
+### ⚠️ Compressed entries and Python bitness
 
-`CECompressv4.dll` is a **32-bit (i386)** DLL, and there is no portable
-open-source reimplementation of this codec — even cross-platform CE tools just
-run this same DLL's machine code. A 32-bit DLL can only be loaded by a **32-bit
-process**, so to decompress/compress entries you must run under **32-bit
-Python**. (The original `Bysin.exe` was a 32-bit program, which is why it could
-use this DLL.)
+`CECompressv4.dll` is a **32-bit (i386)** DLL and there is no portable
+open-source reimplementation of this codec, so the genuine DLL must do the work.
+There are two supported ways to run:
 
-If you only need to inspect the image or pull out the **uncompressed** entries,
-any Python on any OS works — compressed entries are simply skipped with a notice.
+**A) 32-bit Python (simplest).** Run everything under 32-bit Python; the DLL
+loads in-process. `py -3-32 dumpnavi_gui.py` / `py -3-32 dumpnavi.py ...`.
 
-**To handle compressed entries:**
-1. Install 32-bit Python from python.org — choose *"Windows installer (32-bit)"*.
-   You can keep your existing 64-bit Python; both can coexist.
-2. Keep `CECompressv4.dll` in the same folder as `dumpnavi.py` (or pass
-   `--codec-dll C:\path\to\CECompressv4.dll`).
-3. Run with the 32-bit interpreter via the `py` launcher:
-   ```
-   py -3-32 dumpnavi.py SMGA2.bin extract
-   ```
-   (Verify you're 32-bit: `py -3-32 -c "import struct;print(struct.calcsize('P')*8)"` → `32`.)
+**B) 64-bit Python with the auto helper (recommended).** You can run the CLI and
+GUI under your normal **64-bit** Python. When it detects it can't load the
+32-bit DLL in-process, it transparently spawns a tiny **32-bit helper process**
+(`ce_worker.py` via `ce_bridge.py`) that loads the real DLL and does the
+(de)compression over a pipe — so the result is still byte-for-byte identical.
+This needs a 32-bit Python to exist *as the helper* (it does not run your main
+program). By default the helper is launched with the `py -3-32` launcher; if
+your 32-bit Python is elsewhere, point to it:
+
+```
+set DUMPNAVI_PY32=C:\Path\to\python32\python.exe
+py dumpnavi_gui.py            # 64-bit main process, 32-bit helper under the hood
+```
+
+If neither a matching in-process DLL nor a 32-bit helper is available, the tools
+still `list` and handle all **uncompressed** entries; compressed ones are
+skipped with a clear notice.
+
+Keep `CECompressv4.dll` next to the scripts (or pass `--codec-dll <path>`).
+
 
 
 ## Usage

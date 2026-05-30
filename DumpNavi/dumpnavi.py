@@ -35,7 +35,7 @@ import os
 import struct
 import sys
 
-from ce_lzx import CeLzxCodec, CodecUnavailable
+from ce_lzx import CeLzxCodec, CodecUnavailable, make_codec
 
 VERSION = "1.4-py"
 
@@ -250,7 +250,7 @@ class BinImage:
             self.f = io.BytesIO(data)
         else:
             self.f = open(path, "r+b")
-        self.codec = codec or CeLzxCodec()
+        self.codec = codec or make_codec()
         # virtual-memory state (mirrors the C++ globals)
         self.blockstart = 0          # file offset where the block list begins
         self.blockstartpos = 0       # file offset of the current/last block hdr
@@ -1067,7 +1067,7 @@ def main(argv: list[str]) -> int:
     extra = args[2:]
 
     bin_dir = os.path.dirname(os.path.abspath(binpath))
-    codec = CeLzxCodec(dll_path, extra_dirs=[bin_dir])
+    codec = make_codec(dll_path, extra_dirs=[bin_dir])
     if command != COMMAND_LIST and not codec.available:
         print("Note: LZX codec unavailable - COMPRESSED entries (marked 'C' in "
               "`list`) will be skipped; everything else is processed normally.")

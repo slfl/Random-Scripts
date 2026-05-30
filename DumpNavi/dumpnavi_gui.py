@@ -29,7 +29,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import dumpnavi as D
-from ce_lzx import CeLzxCodec, CodecUnavailable
+from ce_lzx import make_codec, CodecUnavailable
 
 APP_TITLE = "DumpNAVI - by SLFL"
 
@@ -61,7 +61,7 @@ class DumpNaviGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.img: D.BinImage | None = None
-        self.codec = CeLzxCodec()
+        self.codec = make_codec()
         self.iid_to_entry: dict[str, D.Entry] = {}
         self._build_ui()
         self._update_title()

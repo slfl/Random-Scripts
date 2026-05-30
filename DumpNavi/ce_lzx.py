@@ -206,3 +206,36 @@ class CeLzxCodec:
         if ret < 0:
             raise RuntimeError("CECompress() failed")
         return bytes(dst[:ret])
+
+
+def make_codec(dll_path: str | None = None,
+               extra_dirs: list[str] | None = None):
+    """Return the best available codec.
+
+    1. Try to load the DLL in-process (works when running 32-bit Python, or if a
+       matching-bitness DLL is present).
+    2. If that fails and we're on 64-bit Windows, transparently spawn a 32-bit
+       helper process (ce_bridge) that loads the real 32-bit DLL.
+    3. Otherwise return the (unavailable) in-process codec, which still carries a
+       helpful diagnostic message.
+
+    The returned object always exposes .available / .load_error / .decompress /
+    .compress, so callers don't care which path was taken.
+    """
+    direct = CeLzxCodec(dll_path, extra_dirs=extra_dirs)
+    if direct.available:
+        return direct
+    if sys.platform == "win32" and _python_bits() == 64:
+        try:
+            from ce_bridge import CeBridgeCodec
+            bridge = CeBridgeCodec(dll_path=dll_path, extra_dirs=extra_dirs)
+            if bridge.available:
+                return bridge
+            # Bridge failed too: merge both reasons for a clearer message.
+            direct._load_error = (
+                "%s | 64-bit helper: %s"
+                % (direct._load_error or "no in-process DLL", bridge.load_error))
+        except Exception as exc:  # noqa: BLE001
+            direct._load_error = "%s | bridge error: %s" % (
+                direct._load_error or "no in-process DLL", exc)
+    return direct
