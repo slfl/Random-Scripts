@@ -6,7 +6,36 @@ found on Acura/Honda navigation DVDs (e.g. `09Touch2.bin`, `09Touch.bin`).
 
 It performs the *identical* analysis and file operations as the original C++
 program: it walks the same `B000FF` block/virtual-memory layout, parses the same
-`ECEC`/ROM/module/file headers, and supports the same four commands.
+`ECEC`/ROM/module/file headers, and supports the same four commands — plus a
+graphical interface (`dumpnavi_gui.py`).
+
+*Python port & GUI by **SLFL**. Original: bysin / guicide / ryebrye / DogP;
+WinCE structs by Willem Jan Hengeveld (itsme).*
+
+## GUI (dumpnavi_gui.py)
+
+A point-and-click front-end built on Tkinter (bundled with the standard Windows
+Python installer — nothing extra to install).
+
+```
+py -3-32 dumpnavi_gui.py        # 32-bit, so compressed entries work too
+```
+
+Workflow:
+1. **Open .bin** — the directory (all modules + files) is parsed and **cached**
+   instantly. Nothing is decompressed yet.
+2. Click a row and **Preview** (or double-click) — only *that* entry is read and
+   decompressed on demand (text shown as text, binary as a hex dump).
+3. Select one / several / all rows → **Extract selected** / **Extract all**.
+4. Select one row → **Replace...** → pick the new file. The change is applied to
+   an **in-memory working copy** — the `.bin` on disk is *not* touched yet.
+   (A replacement that doesn't fit the original slot is refused with a clear note.)
+5. **Save** writes all staged changes back to the `.bin` at once (it makes a
+   `.bak` backup first); **Save As...** writes a copy.
+
+There's a filter box (type to narrow the 700+ entries) and click-to-sort
+columns. The title bar shows `*` while there are unsaved changes.
+
 
 ## Requirements
 
@@ -125,5 +154,5 @@ are skipped until you run under 32-bit Python.
 
 ## License
 
-GPLv2, as the original. Original authors: bysin, guicide, ryebrye, DogP;
-WinCE structs by Willem Jan Hengeveld (itsme).
+GPLv2, as the original. Python port & GUI: SLFL. Original authors: bysin,
+guicide, ryebrye, DogP; WinCE structs by Willem Jan Hengeveld (itsme).

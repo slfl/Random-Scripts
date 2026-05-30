@@ -23,6 +23,8 @@ entries need the codec, and a clear message is shown if it is missing.
 
 Original authors: bysin, guicide, ryebrye, DogP; structs from Willem Jan
 Hengeveld (itsme).  Licensed GPLv2, as the original.
+
+Python port & GUI: SLFL
 """
 
 from __future__ import annotations
@@ -103,6 +105,39 @@ U32_MASK = 0xFFFFFFFF
 
 def u32(v: int) -> int:
     return v & U32_MASK
+
+
+class ImageError(Exception):
+    """Raised when the .bin can't be parsed or a needed region is missing."""
+
+
+class Entry:
+    """A cached directory entry (one module or one file). Used by the GUI."""
+    __slots__ = ("kind", "index", "name", "attr", "size", "size2",
+                 "offset", "romaddr", "compressed")
+
+    def __init__(self, kind, index, name, attr, size, size2, offset, romaddr,
+                 compressed):
+        self.kind = kind          # "module" or "file"
+        self.index = index
+        self.name = name
+        self.attr = attr
+        self.size = size          # uncompressed size
+        self.size2 = size2        # stored (possibly compressed) size; None for modules
+        self.offset = offset      # ROM data offset (files); None for modules
+        self.romaddr = romaddr
+        self.compressed = compressed
+
+    @property
+    def flags(self) -> str:
+        if self.kind == "module":
+            c = "C" if self.attr & FILEATTR_COMPRESS_MODULE else "_"
+        else:
+            c = "C" if self.attr & FILEATTR_COMPRESS else "_"
+        return (c
+                + ("H" if self.attr & FILEATTR_HIDDEN else "_")
+                + ("R" if self.attr & FILEATTR_READONLY else "_")
+                + ("S" if self.attr & FILEATTR_SYSTEM else "_"))
 
 
 # --------------------------------------------------------------------------- #
@@ -206,9 +241,15 @@ def parse_pe_sections(data: bytes):
 # --------------------------------------------------------------------------- #
 class BinImage:
     def __init__(self, path: str, codec: CeLzxCodec | None = None,
-                 outdir: str | None = None):
+                 outdir: str | None = None, data: bytes | None = None):
         self.path = path
-        self.f = open(path, "r+b")
+        # `data` not None  -> work on an in-memory copy (GUI: nothing is written
+        # to disk until save()).  Otherwise open the real file read/write (CLI).
+        self.in_memory = data is not None
+        if self.in_memory:
+            self.f = io.BytesIO(data)
+        else:
+            self.f = open(path, "r+b")
         self.codec = codec or CeLzxCodec()
         # virtual-memory state (mirrors the C++ globals)
         self.blockstart = 0          # file offset where the block list begins
@@ -223,12 +264,15 @@ class BinImage:
         self.romhdr: RomHdr | None = None
         self.modules: list[ModuleHdr] = []
         self.files: list[FileHdr] = []
+        self.entries: list[Entry] = []     # cached directory (GUI)
         # output directory name (derived from the bin filename, as in main())
         self.binfile = outdir if outdir is not None else self._derive_outdir(path)
         # per-run segment name counters (global in the original)
         self._seg_usage = [0, 0, 0, 0, 0]
         # entries skipped because the LZX codec was unavailable
         self.skipped: list[str] = []
+        # True once a staged replacement has modified the in-memory buffer
+        self.dirty = False
 
     def _skip(self, name: str, why: str):
         self.skipped.append(name)
@@ -389,6 +433,171 @@ class BinImage:
         self.romhdr = RomHdr.unpack(self.virtual_read(ROMHDR_SIZE))
         return 1
 
+    def load(self) -> "BinImage":
+        """Parse the container headers. Raises ImageError on failure."""
+        if not self.read_header():
+            raise ImageError("Invalid XIP file")
+        if not self.read_ecec():
+            raise ImageError("Invalid ECEC header")
+        if not self.read_romhdr():
+            self.addroffs = u32(-0x07FCE000)   # WinCE-image ROMOFFSET fallback
+            if not self.read_romhdr():
+                raise ImageError("Invalid ROM header")
+        return self
+
+    # --- library API (used by the GUI) ----------------------------------- #
+    def scan_entries(self) -> list[Entry]:
+        """Resolve the full module+file directory WITHOUT extracting data.
+
+        This is the 'cache on open' step: only names/sizes/offsets are read;
+        nothing is decompressed until get_entry_bytes() is called.
+        """
+        entries: list[Entry] = []
+
+        if not self.virtual_seek(self.romhdraddr + ROMHDR_SIZE):
+            raise ImageError("Unable to read module table")
+        self.modules = [ModuleHdr.unpack(self.virtual_read(MODULEHDR_SIZE))
+                        for _ in range(self.romhdr.nummods)]
+        for i, m in enumerate(self.modules):
+            m.name = self._read_name(m.fileaddr)
+            if m.name is None:
+                raise ImageError("Unable to read module name")
+            entries.append(Entry("module", i, m.name, m.attr, m.size, None,
+                                  None, m.offset,
+                                  bool(m.attr & FILEATTR_COMPRESS_MODULE)))
+
+        base = (self.romhdraddr + ROMHDR_SIZE
+                + MODULEHDR_SIZE * self.romhdr.nummods)
+        if not self.virtual_seek(base):
+            raise ImageError("Unable to read file table")
+        self.files = [FileHdr.unpack(self.virtual_read(FILEHDR_SIZE))
+                      for _ in range(self.romhdr.numfiles)]
+        for i, fh in enumerate(self.files):
+            fh.name = self._read_name(fh.fileaddr)
+            if fh.name is None:
+                raise ImageError("Unable to read file name")
+            entries.append(Entry("file", i, fh.name, fh.attr, fh.size,
+                                  fh.size2, fh.offset, fh.offset,
+                                  bool(fh.attr & FILEATTR_COMPRESS)))
+
+        self.entries = entries
+        return entries
+
+    def get_entry_bytes(self, entry: Entry) -> bytes:
+        """Return the (decompressed/reconstructed) content of ONE entry.
+
+        Decompression happens here, on demand - only for the entry requested.
+        Raises CodecUnavailable/RuntimeError if a compressed entry needs the
+        codec and it isn't loaded, or ImageError on a structural problem.
+        """
+        if entry.kind == "module":
+            return self._build_module_bytes(entry.index, self.modules[entry.index])
+        fh = self.files[entry.index]
+        if not self.virtual_seek(fh.offset):
+            raise ImageError("Unable to read block file")
+        buf = self.virtual_read(fh.size2)
+        if fh.attr & FILEATTR_COMPRESS:
+            return self.codec.decompress(buf, fh.size)
+        return buf
+
+    def replace_file(self, index: int, data: bytes) -> tuple[bool, str]:
+        """Replace a FILE entry in the in-memory buffer. Returns (ok, message).
+
+        Mirrors the original `update` logic (compress only if the raw data
+        won't fit), but returns status instead of printing, and never writes
+        to disk - the change lives in the working buffer until save()."""
+        fh = self.files[index]
+        attr = fh.attr
+        st_size = len(data)
+        if not self.virtual_seek(fh.offset):
+            return False, "Unable to seek to file data"
+
+        if not (attr & FILEATTR_COMPRESS):
+            if st_size > fh.size2:
+                attr |= FILEATTR_COMPRESS         # too big raw -> must compress
+            else:
+                self.virtual_write(data)
+                self.update_file_size(index, st_size, st_size, attr)
+                self.dirty = True
+                fh.size, fh.size2, fh.attr = st_size, st_size, attr
+                return True, "Stored %d bytes (uncompressed)." % st_size
+
+        # compressed path
+        try:
+            out = self.codec.compress(data, st_size + 20)
+        except CodecUnavailable as e:
+            return False, "Compression needs the LZX codec: %s" % e
+        except RuntimeError:
+            return False, "CECompress() failed."
+        if len(out) > fh.size2:
+            return (False,
+                    "Too big: new data compresses to %d bytes but the slot is "
+                    "only %d bytes. The replacement must fit the original slot."
+                    % (len(out), fh.size2))
+        self.virtual_write(out)
+        self.update_file_size(index, st_size, len(out), attr)
+        self.dirty = True
+        fh.size, fh.size2, fh.attr = st_size, len(out), attr
+        return True, "Stored %d bytes (compressed to %d / slot %d)." % (
+            st_size, len(out), fh.size2)
+
+    def replace_module(self, index: int, data: bytes) -> tuple[bool, str]:
+        """Replace a MODULE (EXE/DLL) in the in-memory buffer. (ok, message)."""
+        m = self.modules[index]
+        if not self.virtual_seek(m.e32offset):
+            return False, "Unable to locate e32offset"
+        e32 = parse_e32_rom(self.virtual_read(E32ROM_SIZE))
+        objcnt = e32["e32_objcnt"]
+        if not self.virtual_seek(m.o32offset):
+            return False, "Unable to locate o32offset"
+        o32 = [parse_o32_rom(self.virtual_read(O32ROM_SIZE))
+               for _ in range(objcnt)]
+        try:
+            num_sections, sections = parse_pe_sections(data)
+        except ValueError as e:
+            return False, "Not a valid PE/EXE: %s" % e
+        if num_sections != objcnt:
+            return (False, "Section count mismatch: new module has %d, ROM "
+                    "module has %d." % (num_sections, objcnt))
+
+        headersize = (DOSHDR_SIZE + len(DOSCODE) + E32EXE_SIZE
+                      + O32OBJ_SIZE * objcnt)
+        if headersize % 0x200:
+            headersize += 0x200 - (headersize % 0x200)
+
+        pos = headersize
+        for s in range(num_sections):
+            sec_size = sections[s]["SizeOfRawData"]
+            section_data = data[pos:pos + sec_size]
+            pos += sec_size
+            if o32[s]["o32_flags"] & SECTION_COMPRESSED:
+                try:
+                    comp = self.codec.compress(section_data, sec_size + 20)
+                except CodecUnavailable as e:
+                    return False, "Compression needs the LZX codec: %s" % e
+                except RuntimeError:
+                    return False, "CECompress() failed."
+                if len(comp) > o32[s]["o32_psize"]:
+                    return (False, "Section %d too big: %d > %d bytes."
+                            % (s, len(comp), o32[s]["o32_psize"]))
+                section_data = comp
+            if not self.virtual_seek(o32[s]["o32_dataptr"]):
+                return False, "Unable to seek to section data"
+            self.virtual_write(section_data)
+        self.dirty = True
+        return True, "Module updated (%d sections)." % num_sections
+
+    def save(self, path: str | None = None) -> str:
+        """Flush the in-memory buffer to disk. Returns the path written."""
+        if not self.in_memory:
+            self.f.flush()
+            return self.path
+        target = path or self.path
+        with open(target, "wb") as out:
+            out.write(self.f.getvalue())
+        self.dirty = False
+        return target
+
     def _read_name(self, addr: int) -> str | None:
         if not self.virtual_seek(addr):
             return None
@@ -447,20 +656,19 @@ class BinImage:
         self._seg_usage[segtype] += 1
         return nm[:8]
 
-    def _extract_module(self, i: int, m: ModuleHdr) -> int:
-        print("Extracting %s ..." % m.name)
-        os.makedirs(self.binfile, exist_ok=True)
-        out_path = os.path.join(self.binfile, m.name)
+    def _build_module_bytes(self, i: int, m: ModuleHdr) -> bytes:
+        """Rebuild a PE/EXE from the ROM module and return it as bytes.
 
+        Raises ImageError on a structural problem, or CodecUnavailable/
+        RuntimeError if a compressed section needs the (missing) codec.
+        """
         if not self.virtual_seek(m.e32offset):
-            print("Unable to locate e32offset")
-            return 0
+            raise ImageError("Unable to locate e32offset")
         e32 = parse_e32_rom(self.virtual_read(E32ROM_SIZE))
         objcnt = e32["e32_objcnt"]
 
         if not self.virtual_seek(m.o32offset):
-            print("Unable to locate o32offset")
-            return 0
+            raise ImageError("Unable to locate o32offset")
         o32 = [parse_o32_rom(self.virtual_read(O32ROM_SIZE))
                for _ in range(objcnt)]
 
@@ -587,18 +795,12 @@ class BinImage:
             dataofslist = r.tell()
             datalenlist = oj["o32_psize"]
             if not self.virtual_seek(oj["o32_dataptr"]):
-                print("Unable to read block file")
-                return 0
+                raise ImageError("Unable to read block file")
             buf = self.virtual_read(oj["o32_psize"])
             if oj["o32_flags"] & SECTION_COMPRESSED:
-                try:
-                    out = self.codec.decompress(buf, oj["o32_vsize"])
-                    r.write(out)
-                    datalenlist = len(out)
-                except (CodecUnavailable, RuntimeError) as e:
-                    print("Error in CEDecompress(): %s" % e)
-                    self._skip(m.name, "compressed section; codec unavailable")
-                    return 1   # skip this module, keep going with the rest
+                out = self.codec.decompress(buf, oj["o32_vsize"])
+                r.write(out)
+                datalenlist = len(out)
             else:
                 r.write(buf)
             size = r.tell()
@@ -613,9 +815,25 @@ class BinImage:
         r.seek(newe32off + 0x54, io.SEEK_SET)
         r.write(struct.pack("<I", headersize))
         r.seek(filesize, io.SEEK_SET)
+        return r.getvalue()
 
-        with open(out_path, "wb") as fh:
-            fh.write(r.getvalue())
+    def _extract_module(self, i: int, m: ModuleHdr) -> int:
+        if (m.attr & FILEATTR_COMPRESS_MODULE) and not self.codec.available:
+            self._skip(m.name, "compressed; codec unavailable")
+            return 1
+        print("Extracting %s ..." % m.name)
+        try:
+            data = self._build_module_bytes(i, m)
+        except (CodecUnavailable, RuntimeError) as e:
+            print("Error in CEDecompress(): %s" % e)
+            self._skip(m.name, "compressed section; codec unavailable")
+            return 1
+        except ImageError as e:
+            print(str(e))
+            return 0
+        os.makedirs(self.binfile, exist_ok=True)
+        with open(os.path.join(self.binfile, m.name), "wb") as fh:
+            fh.write(data)
         return 1
 
     def _update_module(self, i: int, m: ModuleHdr, names: list[str]) -> int:
@@ -806,8 +1024,8 @@ class BinImage:
 # Driver
 # --------------------------------------------------------------------------- #
 def usage(prog: str):
-    print("Bysin %s by bysin (ported to Python; orig. guicide/ryebrye/DogP)\n"
-          % VERSION)
+    print("Bysin %s by bysin (Python port & GUI by SLFL; orig. "
+          "guicide/ryebrye/DogP)\n" % VERSION)
     print("%s <filename> <command>" % prog)
     print("Valid commands are:")
     print("  list                          - lists contents")
@@ -862,17 +1080,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     with img:
-        if not img.read_header():
-            print("Invalid XIP file")
+        try:
+            img.load()
+        except ImageError as e:
+            print(str(e))
             return 0
-        if not img.read_ecec():
-            print("Invalid ECEC header")
-            return 0
-        if not img.read_romhdr():
-            img.addroffs = u32(-0x07FCE000)   # retry with WinCE-image ROMOFFSET
-            if not img.read_romhdr():
-                print("Invalid ROM header")
-                return 0
         img.read_modules(command, extra)
         img.read_files(command, extra)
         if img.skipped and command != COMMAND_LIST:
