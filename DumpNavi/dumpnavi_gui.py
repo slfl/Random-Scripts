@@ -75,6 +75,7 @@ class DumpNaviGUI:
         bar = ttk.Frame(self.root, padding=(8, 6))
         bar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(bar, text="Open .bin", command=self.open_bin).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Info", command=self.show_info).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="Preview", command=self.preview).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="Extract selected", command=self.extract_selected).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="Extract all", command=self.extract_all).pack(side=tk.LEFT, padx=(6, 0))
@@ -193,6 +194,26 @@ class DumpNaviGUI:
         return [self.iid_to_entry[i] for i in self.tree.selection()]
 
     # ------------------------------------------------------------- preview --
+    def show_info(self):
+        if not self.img:
+            self._set_status("Open a .bin first.")
+            return
+        try:
+            text = self.img.format_info()
+            checked, bad = self.img.verify_checksums()
+            text += ("\nBlock checksums: %d checked, %d mismatched%s"
+                     % (checked, bad, "  (OK)" if bad == 0 else "  (!)"))
+        except Exception as ex:  # noqa: BLE001
+            messagebox.showerror("Info failed", str(ex))
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Image info: %s" % os.path.basename(self.img.path))
+        win.geometry("620x360")
+        t = tk.Text(win, wrap=tk.NONE, font=("Consolas", 10))
+        t.pack(fill=tk.BOTH, expand=True)
+        t.insert("1.0", text)
+        t.configure(state=tk.DISABLED)
+
     def preview(self):
         sel = self._selected_entries()
         if not self.img or not sel:

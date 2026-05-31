@@ -24,14 +24,41 @@ py -3-32 dumpnavi_gui.py        # 32-bit, so compressed entries work too
 Workflow:
 1. **Open .bin** — the directory (all modules + files) is parsed and **cached**
    instantly. Nothing is decompressed yet.
-2. Click a row and **Preview** (or double-click) — only *that* entry is read and
-   decompressed on demand (text shown as text, binary as a hex dump).
+2. **Info** shows the image header, ROM header, block map and entry/compression
+   summary (plus a block-checksum check). Click a row and **Preview** (or
+   double-click) — only *that* entry is read and decompressed on demand.
 3. Select one / several / all rows → **Extract selected** / **Extract all**.
 4. Select one row → **Replace...** → pick the new file. The change is applied to
    an **in-memory working copy** — the `.bin` on disk is *not* touched yet.
-   (A replacement that doesn't fit the original slot is refused with a clear note.)
 5. **Save** writes all staged changes back to the `.bin` at once (it makes a
    `.bak` backup first); **Save As...** writes a copy.
+
+## Replacing files — and can a file be made BIGGER?
+
+Short answer: the **logical** size of a file can grow a lot, but the **stored**
+(on-disk) bytes must still fit the slot the original occupied. The tool handles
+this automatically:
+
+* If the new data fits the slot uncompressed → stored as-is.
+* If it's larger than the slot → it is **LZX-compressed**; if the compressed
+  form fits the slot, it's stored and the file's *uncompressed* size is updated
+  to the new (larger) value. So replacing a 1 MB file with 2 MB of *compressible*
+  content works whenever the 2 MB compresses down to ≤ the original slot. The
+  device allocates RAM by the uncompressed size and decompresses on load.
+* If even the compressed form is bigger than the slot → it's refused, with the
+  exact overflow reported.
+
+**Why the `.bin` itself can't simply grow:** these images are flash partitions
+laid out as `physfirst..physlast`, immediately followed by RAM (`ulRAMStart`),
+with **zero** trailing slack in the file. Modules are XIP (execute-in-place) at
+fixed addresses and can't be moved to make room. Enlarging the ROM region would
+collide with the memory map / flash partition and is not safe to do blindly — so
+the tool deliberately keeps stored data within the original slot (exactly the
+limitation the original `Bysin` documented as "must be ≤ the old size"). Use
+`info` to see each image's `ROM->RAM gap` and confirm there's no room to grow.
+
+Modules (EXE/DLL) cannot be grown at all (fixed XIP layout); only their sections
+can be replaced in place.
 
 There's a filter box (type to narrow the 700+ entries) and click-to-sort
 columns. The title bar shows `*` while there are unsaved changes.
@@ -81,6 +108,7 @@ Keep `CECompressv4.dll` next to the scripts (or pass `--codec-dll <path>`).
 python dumpnavi.py <filename.bin> <command> [args...]
 
 Commands:
+  info                          - image header / block map / entry summary
   list                          - list all modules (EXE/DLL) and files
   extract [names...]            - extract all entries, or only the named ones
   update  <name> [infile]       - replace a FILE entry inside the .bin

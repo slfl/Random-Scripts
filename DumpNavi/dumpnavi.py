@@ -174,7 +174,7 @@ class ModuleHdr:
 
 class FileHdr:
     __slots__ = ("attr", "time", "time2", "size", "size2",
-                 "fileaddr", "offset", "name")
+                 "fileaddr", "offset", "name", "cap")
 
     @classmethod
     def unpack(cls, data: bytes) -> "FileHdr":
@@ -185,6 +185,7 @@ class FileHdr:
         self.size, self.size2, self.fileaddr, self.offset = (
             size, size2, fileaddr, off)
         self.name = None
+        self.cap = size2          # original reserved capacity (set at scan)
         return self
 
 
@@ -241,15 +242,17 @@ def parse_pe_sections(data: bytes):
 # --------------------------------------------------------------------------- #
 class BinImage:
     def __init__(self, path: str, codec: CeLzxCodec | None = None,
-                 outdir: str | None = None, data: bytes | None = None):
+                 outdir: str | None = None, data: bytes | None = None,
+                 writable: bool = True):
         self.path = path
         # `data` not None  -> work on an in-memory copy (GUI: nothing is written
-        # to disk until save()).  Otherwise open the real file read/write (CLI).
+        # to disk until save()).  Otherwise open the real file (read-only unless
+        # writable, so read-only .bin files can still be inspected/extracted).
         self.in_memory = data is not None
         if self.in_memory:
             self.f = io.BytesIO(data)
         else:
-            self.f = open(path, "r+b")
+            self.f = open(path, "r+b" if writable else "rb")
         self.codec = codec or make_codec()
         # virtual-memory state (mirrors the C++ globals)
         self.blockstart = 0          # file offset where the block list begins
@@ -508,19 +511,22 @@ class BinImage:
         to disk - the change lives in the working buffer until save()."""
         fh = self.files[index]
         attr = fh.attr
+        slot = fh.cap            # ORIGINAL reserved bytes (physical room; safe ceiling)
+        prev_size = fh.size
         st_size = len(data)
         if not self.virtual_seek(fh.offset):
             return False, "Unable to seek to file data"
 
         if not (attr & FILEATTR_COMPRESS):
-            if st_size > fh.size2:
+            if st_size > slot:
                 attr |= FILEATTR_COMPRESS         # too big raw -> must compress
             else:
                 self.virtual_write(data)
                 self.update_file_size(index, st_size, st_size, attr)
                 self.dirty = True
                 fh.size, fh.size2, fh.attr = st_size, st_size, attr
-                return True, "Stored %d bytes (uncompressed)." % st_size
+                return True, ("Stored %d bytes uncompressed (slot %d, %d free)."
+                              % (st_size, slot, slot - st_size))
 
         # compressed path
         try:
@@ -529,17 +535,20 @@ class BinImage:
             return False, "Compression needs the LZX codec: %s" % e
         except RuntimeError:
             return False, "CECompress() failed."
-        if len(out) > fh.size2:
+        if len(out) > slot:
             return (False,
-                    "Too big: new data compresses to %d bytes but the slot is "
-                    "only %d bytes. The replacement must fit the original slot."
-                    % (len(out), fh.size2))
+                    "Won't fit: new data is %d bytes and compresses to %d, but "
+                    "the reserved slot is only %d bytes. The COMPRESSED form must "
+                    "fit the original slot (the .bin can't safely grow); overflow "
+                    "by %d bytes." % (st_size, len(out), slot, len(out) - slot))
         self.virtual_write(out)
         self.update_file_size(index, st_size, len(out), attr)
         self.dirty = True
         fh.size, fh.size2, fh.attr = st_size, len(out), attr
-        return True, "Stored %d bytes (compressed to %d / slot %d)." % (
-            st_size, len(out), fh.size2)
+        grew = ("  Logical size %d -> %d." % (prev_size, st_size)
+                if st_size != prev_size else "")
+        return True, ("Stored %d bytes, compressed to %d (slot %d, %d free).%s"
+                      % (st_size, len(out), slot, slot - len(out), grew))
 
     def replace_module(self, index: int, data: bytes) -> tuple[bool, str]:
         """Replace a MODULE (EXE/DLL) in the in-memory buffer. (ok, message)."""
@@ -597,6 +606,114 @@ class BinImage:
             out.write(self.f.getvalue())
         self.dirty = False
         return target
+
+    # --- structural inspection ------------------------------------------- #
+    def iter_blocks(self):
+        """Yield (hdr_pos, addr, length, chksum, data_pos) for every B000FF
+        block (including the terminator with addr==0). Moves the file pointer."""
+        self.f.seek(self.blockstart)
+        while True:
+            pos = self.f.tell()
+            hdr = self.f.read(BLOCKHDR_SIZE)
+            if len(hdr) < BLOCKHDR_SIZE:
+                return
+            a, l, c = struct.unpack(BLOCKHDR_FMT, hdr)
+            data_pos = self.f.tell()
+            yield (pos, a, l, c, data_pos)
+            if a == 0:
+                return
+            self.f.seek(l, io.SEEK_CUR)
+
+    def verify_checksums(self, limit: int | None = None) -> tuple[int, int]:
+        """Return (checked, mismatched) over real blocks (optionally capped)."""
+        # Materialise the block list first: reading block payloads below moves
+        # the file pointer, which would otherwise desync the live generator.
+        blocks = [b for b in self.iter_blocks() if b[1] != 0]
+        checked = mismatched = 0
+        for (_pos, _a, l, c, dp) in blocks:
+            self.f.seek(dp)
+            if (sum(self.f.read(l)) & U32_MASK) != c:
+                mismatched += 1
+            checked += 1
+            if limit and checked >= limit:
+                break
+        return checked, mismatched
+
+    def image_info(self) -> dict:
+        """A structured summary of the image (header, ROM header, blocks,
+        entries, compression). Used by the `info` command and the GUI."""
+        if not self.entries:
+            self.scan_entries()
+        names = ("dllfirst", "dlllast", "physfirst", "physlast", "nummods",
+                 "ulRAMStart", "ulRAMFree", "ulRAMEnd", "ulCopyEntries",
+                 "ulCopyOffset", "ulProfileLen", "ulProfileOffset", "numfiles",
+                 "ulKernelFlags", "ulFSRamPercent", "ulDrivglobStart",
+                 "ulDrivglobLen", "usCPUType", "usMiscFlags", "pExtensions",
+                 "ulTrackingStart", "ulTrackingLen")
+        romhdr = dict(zip(names, self.romhdr.raw))
+
+        blocks = list(self.iter_blocks())
+        real = [(a, l) for (_p, a, l, _c, _d) in blocks if a != 0]
+        payload = sum(l for _a, l in real)
+        va_lo = min((a for a, _ in real), default=0)
+        va_hi = max((a + l for a, l in real), default=0)
+
+        mods = [e for e in self.entries if e.kind == "module"]
+        files = [e for e in self.entries if e.kind == "file"]
+        cfiles = [e for e in files if e.compressed]
+
+        try:
+            file_size = self.f.seek(0, io.SEEK_END)
+        except Exception:  # noqa: BLE001
+            file_size = None
+
+        return {
+            "path": self.path,
+            "file_size": file_size,
+            "imageaddr": self.imageaddr,
+            "imagelen": self.imagelen,
+            "romhdraddr": self.romhdraddr,
+            "romoffset": u32(self.addroffs),
+            "romhdr": romhdr,
+            "image_span": romhdr["physlast"] - romhdr["physfirst"],
+            "rom_to_ram_gap": romhdr["ulRAMStart"] - romhdr["physlast"],
+            "num_blocks": len(blocks),
+            "block_payload": payload,
+            "va_range": (va_lo, va_hi),
+            "num_modules": len(mods),
+            "num_files": len(files),
+            "num_compressed": len(cfiles),
+            "num_uncompressed": len(files) - len(cfiles),
+        }
+
+    def format_info(self) -> str:
+        """Human-readable version of image_info()."""
+        i = self.image_info()
+        rh = i["romhdr"]
+        L = []
+        a = L.append
+        a("File:        %s" % os.path.basename(i["path"] or "?"))
+        if i["file_size"] is not None:
+            a("File size:   %d bytes (0x%x)" % (i["file_size"], i["file_size"]))
+        a("Image addr:  0x%08x   length 0x%08x (%d bytes)"
+          % (i["imageaddr"], i["imagelen"], i["imagelen"]))
+        a("ROM header:  0x%08x   ROMOFFSET 0x%08x"
+          % (i["romhdraddr"], i["romoffset"]))
+        a("Phys range:  0x%08x .. 0x%08x  (span %d bytes)"
+          % (rh["physfirst"], rh["physlast"], i["image_span"]))
+        a("RAM:         start 0x%08x  free 0x%08x  end 0x%08x"
+          % (rh["ulRAMStart"], rh["ulRAMFree"], rh["ulRAMEnd"]))
+        a("ROM->RAM gap: %d bytes  (free address space right after the image)"
+          % i["rom_to_ram_gap"])
+        a("CPU type:    0x%04x   FSRamPercent 0x%x"
+          % (rh["usCPUType"], rh["ulFSRamPercent"]))
+        a("Blocks:      %d   payload %d bytes   VA 0x%08x..0x%08x"
+          % (i["num_blocks"], i["block_payload"], i["va_range"][0],
+             i["va_range"][1]))
+        a("Modules:     %d   Files: %d (compressed %d / uncompressed %d)"
+          % (i["num_modules"], i["num_files"], i["num_compressed"],
+             i["num_uncompressed"]))
+        return "\n".join(L)
 
     def _read_name(self, addr: int) -> str | None:
         if not self.virtual_seek(addr):
@@ -1028,6 +1145,7 @@ def usage(prog: str):
           "guicide/ryebrye/DogP)\n" % VERSION)
     print("%s <filename> <command>" % prog)
     print("Valid commands are:")
+    print("  info                          - image header / block / entry summary")
     print("  list                          - lists contents")
     print("  extract [files...]            - extract all/specified files")
     print("  update outfile [infile]       - update specified files")
@@ -1054,6 +1172,8 @@ def main(argv: list[str]) -> int:
     cmd = args[1].lower()
     if cmd == "list":
         command = COMMAND_LIST
+    elif cmd == "info":
+        command = 0   # handled specially below
     elif cmd == "extract":
         command = COMMAND_EXTRACT
     elif cmd == "update" and len(args) >= 3:
@@ -1068,13 +1188,16 @@ def main(argv: list[str]) -> int:
 
     bin_dir = os.path.dirname(os.path.abspath(binpath))
     codec = make_codec(dll_path, extra_dirs=[bin_dir])
-    if command != COMMAND_LIST and not codec.available:
+    needs_codec = command in (COMMAND_EXTRACT, COMMAND_UPDATE,
+                              COMMAND_UPDATE_MODULE)
+    if needs_codec and not codec.available:
         print("Note: LZX codec unavailable - COMPRESSED entries (marked 'C' in "
               "`list`) will be skipped; everything else is processed normally.")
         print("      Reason: %s" % (codec.load_error or "no DLL"))
 
+    writable = command in (COMMAND_UPDATE, COMMAND_UPDATE_MODULE)
     try:
-        img = BinImage(binpath, codec=codec)
+        img = BinImage(binpath, codec=codec, writable=writable)
     except OSError:
         print("Unable to open BIN file")
         return 0
@@ -1084,6 +1207,12 @@ def main(argv: list[str]) -> int:
             img.load()
         except ImageError as e:
             print(str(e))
+            return 0
+        if cmd == "info":
+            print(img.format_info())
+            checked, bad = img.verify_checksums()
+            print("Block checksums: %d checked, %d mismatched%s"
+                  % (checked, bad, "  (OK)" if bad == 0 else "  (!)"))
             return 0
         img.read_modules(command, extra)
         img.read_files(command, extra)
