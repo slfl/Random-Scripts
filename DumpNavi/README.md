@@ -70,6 +70,19 @@ can be replaced in place.
 There's a filter box (type to narrow the 700+ entries) and click-to-sort
 columns. The title bar shows `*` while there are unsaved changes.
 
+### Languages
+
+The current language is shown as a small badge (e.g. **EN** / **RU**) in the
+bottom-right corner. Click it to pick another from a small drop-up menu; the
+whole UI updates instantly and your choice is remembered (`gui_settings.ini`).
+
+All text lives in **`language.ini`** — one `[Section]` per language. To add a
+language, copy the `[English]` block, rename it (e.g. `[Italiano]`), set
+`code = IT`, translate the values, and save. It appears in the menu
+automatically the next time you open it. Partial translations are fine —
+anything you don't translate falls back to English. Keep the `{0}`, `{1}`
+placeholders and `\n` line breaks intact. Ships with English and Russian.
+
 
 ## Requirements
 
