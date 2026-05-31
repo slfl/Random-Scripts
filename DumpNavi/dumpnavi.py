@@ -550,6 +550,43 @@ class BinImage:
         return True, ("Stored %d bytes, compressed to %d (slot %d, %d free).%s"
                       % (st_size, len(out), slot, slot - len(out), grew))
 
+    def slot_capacity(self, index: int) -> int:
+        """Original reserved bytes (max stored size) for a file entry."""
+        return self.files[index].cap
+
+    def file_fit(self, index: int, data: bytes) -> dict:
+        """Dry-run: would `data` fit file #index? Computes the stored size
+        (compressing if needed) WITHOUT modifying anything.
+
+        Returns a dict: {mode, logical, stored, slot, fits, free, overflow,
+        error}. `stored`/`fits` are None if compression was needed but the
+        codec is unavailable."""
+        fh = self.files[index]
+        slot = fh.cap
+        st = len(data)
+        res = {"mode": None, "logical": st, "stored": None, "slot": slot,
+               "fits": None, "free": None, "overflow": None, "error": None}
+
+        if not (fh.attr & FILEATTR_COMPRESS) and st <= slot:
+            res.update(mode="uncompressed", stored=st, fits=True,
+                       free=slot - st, overflow=0)
+            return res
+        # would be stored compressed
+        try:
+            out = self.codec.compress(data, st + 20)
+        except CodecUnavailable as e:
+            res.update(mode="compressed", error=str(e))
+            return res
+        except RuntimeError:
+            res.update(mode="compressed", error="CECompress() failed")
+            return res
+        stored = len(out)
+        fits = stored <= slot
+        res.update(mode="compressed", stored=stored, fits=fits,
+                   free=max(slot - stored, 0),
+                   overflow=max(stored - slot, 0))
+        return res
+
     def replace_module(self, index: int, data: bytes) -> tuple[bool, str]:
         """Replace a MODULE (EXE/DLL) in the in-memory buffer. (ok, message)."""
         m = self.modules[index]

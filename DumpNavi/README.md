@@ -30,8 +30,15 @@ Workflow:
 3. Select one / several / all rows → **Extract selected** / **Extract all**.
 4. Select one row → **Replace...** → pick the new file. The change is applied to
    an **in-memory working copy** — the `.bin` on disk is *not* touched yet.
+   * Selecting a single file shows a **room indicator** in the status bar: the
+     slot capacity (max stored bytes), how much is currently used and how much is
+     free. Modules show that they can't be resized.
+   * **Check fit...** is a dry run: pick a candidate file and it computes the
+     stored/compressed size and tells you whether it fits (headroom or overflow)
+     — without changing anything.
 5. **Save** writes all staged changes back to the `.bin` at once (it makes a
-   `.bak` backup first); **Save As...** writes a copy.
+   `.bak` backup first); **Save As...** writes a copy. The `.bin` keeps its
+   original size.
 
 ## Replacing files — and can a file be made BIGGER?
 

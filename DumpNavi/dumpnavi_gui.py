@@ -80,6 +80,7 @@ class DumpNaviGUI:
         ttk.Button(bar, text="Extract selected", command=self.extract_selected).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="Extract all", command=self.extract_all).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="Replace...", command=self.replace_selected).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(bar, text="Check fit...", command=self.check_fit).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar, text="Save", command=self.save).pack(side=tk.LEFT, padx=(18, 0))
         ttk.Button(bar, text="Save As...", command=self.save_as).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -110,6 +111,7 @@ class DumpNaviGUI:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.LEFT, fill=tk.Y)
         self.tree.bind("<Double-1>", lambda e: self.preview())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
 
         self.status = tk.StringVar()
         ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN,
@@ -192,6 +194,69 @@ class DumpNaviGUI:
     # ------------------------------------------------------ selection util --
     def _selected_entries(self) -> list[D.Entry]:
         return [self.iid_to_entry[i] for i in self.tree.selection()]
+
+    def _on_select(self):
+        """Passive room indicator for a single selected file."""
+        sel = self._selected_entries()
+        if not self.img or len(sel) != 1:
+            return
+        e = sel[0]
+        if e.kind == "module":
+            self._set_status("%s — module (XIP): fixed size, can't be resized; "
+                             "sections are replaced in place." % e.name)
+            return
+        cap = self.img.slot_capacity(e.index)
+        free = cap - (e.size2 or 0)
+        self._set_status(
+            "%s — slot %d bytes (max stored). Currently stored %d, %d free. "
+            "A replacement may be larger if it compresses to <= %d bytes."
+            % (e.name, cap, e.size2 or 0, free, cap))
+
+    def check_fit(self):
+        """Dry-run a replacement: compute the stored/compressed size of a
+        candidate file and report headroom, without modifying anything."""
+        sel = self._selected_entries()
+        if not self.img or len(sel) != 1:
+            self._set_status("Select exactly one entry to check.")
+            return
+        e = sel[0]
+        if e.kind == "module":
+            messagebox.showinfo("Check fit",
+                                "Modules are execute-in-place and can't be "
+                                "resized. Only their sections are replaced in "
+                                "place (same size).")
+            return
+        src = filedialog.askopenfilename(title="Check fit of file against %s" % e.name)
+        if not src:
+            return
+        try:
+            data = open(src, "rb").read()
+        except OSError as ex:
+            messagebox.showerror("Check fit", "Can't read file:\n%s" % ex)
+            return
+        info = self.img.file_fit(e.index, data)
+        cand = os.path.basename(src)
+        if info["error"]:
+            messagebox.showwarning(
+                "Check fit",
+                "%s is %d bytes and would be stored COMPRESSED, but the codec "
+                "isn't available to measure it:\n\n%s" % (cand, info["logical"],
+                                                          info["error"]))
+            return
+        if info["fits"]:
+            verdict = "FITS — %d bytes free in the slot." % info["free"]
+            icon = messagebox.showinfo
+        else:
+            verdict = "DOES NOT FIT — overflows by %d bytes." % info["overflow"]
+            icon = messagebox.showwarning
+        msg = ("Candidate: %s\nLogical size: %d bytes\nWould be stored: %d bytes"
+               " (%s)\nSlot capacity: %d bytes\n\n%s"
+               % (cand, info["logical"], info["stored"], info["mode"],
+                  info["slot"], verdict))
+        icon("Check fit: %s" % e.name, msg)
+        self._set_status("Check fit %s: stored %d / slot %d -> %s"
+                         % (cand, info["stored"], info["slot"],
+                            "fits" if info["fits"] else "too big"))
 
     # ------------------------------------------------------------- preview --
     def show_info(self):
