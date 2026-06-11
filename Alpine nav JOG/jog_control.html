@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JOG Control — Honda/Alpine nav</title>
+<style>
+  :root{ --bg:#15171c; --panel:#1e2128; --btn:#2a2e37; --btn2:#343a45;
+         --edge:#3a4150; --accent:#39c2ff; --txt:#e6e9ef; --dim:#8b93a3; --ok:#46d27a; }
+  *{box-sizing:border-box; font-family:system-ui,Segoe UI,Roboto,sans-serif}
+  body{margin:0; background:var(--bg); color:var(--txt); padding:18px}
+  h1{font-size:16px; font-weight:600; margin:0 0 12px}
+  .bar{display:flex; gap:10px; align-items:center; margin-bottom:16px; flex-wrap:wrap}
+  button{cursor:pointer; color:var(--txt); background:var(--btn); border:1px solid var(--edge);
+          border-radius:10px; padding:12px 14px; font-size:14px; user-select:none; -webkit-user-select:none}
+  button:hover{background:var(--btn2)}
+  /* нажатие: ТОЛЬКО подсветка, никаких transform/сдвигов — кнопки не двигаются */
+  button:active, button.pressed{ background:#2f5a78; border-color:var(--accent) }
+  .pill{padding:8px 14px; border-radius:20px}
+  .pill.connect{background:#1c3a2a; border-color:#2f6a48}
+  .status{font-size:13px; color:var(--dim)}
+  .status.on{color:var(--ok)} .status.err{color:#ff6b6b}
+  .panel{display:grid; grid-template-columns:130px 280px 130px 110px; gap:22px; align-items:center;
+          background:var(--panel); border:1px solid var(--edge); border-radius:16px; padding:24px; width:max-content}
+  .col{display:flex; flex-direction:column; gap:14px}
+  .col button{width:130px; text-align:center}
+  .jog{position:relative; width:280px; height:280px; margin:auto}
+  .ring{position:absolute; inset:0; border-radius:50%; background:radial-gradient(circle at 50% 40%,#2b303a,#191c22);
+        border:2px solid var(--edge); box-shadow:inset 0 0 30px #0008}
+  .dir{position:absolute; width:62px; height:62px; border-radius:12px; background:var(--btn);
+       border:1px solid var(--edge); display:flex; align-items:center; justify-content:center; font-size:22px; padding:0}
+  .dir.up{top:14px; left:50%; margin-left:-31px}
+  .dir.down{bottom:14px; left:50%; margin-left:-31px}
+  .dir.left{left:14px; top:50%; margin-top:-31px}
+  .dir.right{right:14px; top:50%; margin-top:-31px}
+  .ent{position:absolute; top:50%; left:50%; margin:-48px 0 0 -48px;
+       width:96px; height:96px; border-radius:50%; background:linear-gradient(180deg,#3a4150,#262b34);
+       border:2px solid #4a5366; font-size:14px; font-weight:700; padding:0}
+  .rot{display:flex; gap:14px; justify-content:center; margin-top:10px}
+  .rot button{width:120px; font-size:18px}
+  .extra{display:flex; flex-direction:column; gap:14px; align-items:center}
+  .bright{width:64px; height:64px; border-radius:50%; font-size:24px; padding:0}
+  .eng{width:104px; font-size:12px; text-align:center; background:#3a2a14; border-color:#6a4a1f; color:#ffd9a0}
+  .eng:active, .eng.pressed{ background:#6a4a1f; border-color:#ffb454 }
+  .log{margin-top:16px; background:#11131a; border:1px solid var(--edge); border-radius:10px; padding:10px;
+       height:120px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; color:#a7d3ff; white-space:pre-wrap}
+  .hint{font-size:12px; color:var(--dim); margin-top:8px; max-width:680px; line-height:1.5}
+  label.beat{display:flex; gap:6px; align-items:center; font-size:13px; color:var(--dim)}
+</style>
+</head>
+<body>
+  <h1>JOG Control — эмулятор пульта навигации</h1>
+  <div class="bar">
+    <button class="pill connect" id="connectBtn">Подключить Arduino</button>
+    <span class="status" id="status">не подключено</span>
+    <label class="beat"><input type="checkbox" id="beatChk"> heartbeat (старт блока)</label>
+  </div>
+
+  <div class="panel">
+    <div class="col">
+      <button data-lo="01" data-hi="00">MAP</button>
+      <button data-lo="04" data-hi="00">CLIMATE</button>
+      <button data-lo="00" data-hi="20">BACK ↩</button>
+    </div>
+
+    <div>
+      <div class="jog">
+        <div class="ring"></div>
+        <button class="dir up"    data-lo="00" data-hi="08">▲</button>
+        <button class="dir down"  data-lo="00" data-hi="02">▼</button>
+        <button class="dir left"  data-lo="00" data-hi="01">◀</button>
+        <button class="dir right" data-lo="00" data-hi="04">▶</button>
+        <button class="ent"       data-lo="40" data-hi="00">PUSH<br>ENT</button>
+      </div>
+      <div class="rot">
+        <button data-rot="ccw">↺ CCW</button>
+        <button data-rot="cw">↻ CW</button>
+      </div>
+    </div>
+
+    <div class="col">
+      <button data-lo="20" data-hi="00">MENU</button>
+      <button data-lo="00" data-hi="40">AUDIO</button>
+      <button data-lo="10" data-hi="00">INFO</button>
+    </div>
+
+    <div class="extra">
+      <button class="bright" data-lo="02" data-hi="00" title="Яркость">☀</button>
+      <button class="eng" data-lo="21" data-hi="00">Инженерное меню</button>
+    </div>
+  </div>
+
+  <div class="log" id="log"></div>
+  <div class="hint">
+    Открой в <b>Chrome</b> или <b>Edge</b>. Закрой Serial Monitor в Arduino IDE (порт занимает одна программа).
+    «Подключить Arduino» → выбери COM‑порт. Любую кнопку можно <b>держать</b> — пока зажата, нажатие активно;
+    отпустил — отпустилось. Энкодер ↺/↻ при удержании крутит непрерывно. Порт 9600.
+  </div>
+
+<script>
+let port=null, writer=null, reader=null;
+const $=s=>document.querySelector(s);
+const logEl=$('#log'), statusEl=$('#status');
+function log(t){ logEl.textContent+=t+"\n"; logEl.scrollTop=logEl.scrollHeight; }
+function setStatus(t,cls){ statusEl.textContent=t; statusEl.className='status '+(cls||''); }
+
+async function connect(){
+  if(!('serial' in navigator)){ setStatus('Web Serial не поддерживается (нужен Chrome/Edge)','err'); return; }
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate:9600 });
+    writer = port.writable.getWriter();
+    setStatus('подключено','on'); readLoop();
+  }catch(e){ setStatus('ошибка: '+e.message,'err'); }
+}
+async function readLoop(){
+  try{
+    reader = port.readable.getReader();
+    const dec=new TextDecoder();
+    while(true){ const {value,done}=await reader.read(); if(done)break; if(value) logEl.textContent+=dec.decode(value); }
+  }catch(e){}
+}
+async function send(cmd){
+  if(!writer){ setStatus('сначала подключи Arduino','err'); return; }
+  try{ await writer.write(new TextEncoder().encode(cmd+"\n")); log("> "+cmd); }catch(e){ setStatus('порт закрыт','err'); }
+}
+$('#connectBtn').addEventListener('click', connect);
+
+// кнопки: удержание hold..rel
+document.querySelectorAll('button[data-lo]').forEach(b=>{
+  const lo=b.dataset.lo, hi=b.dataset.hi; let pressed=false;
+  const down=e=>{ e.preventDefault(); if(pressed)return; pressed=true; b.classList.add('pressed'); send(`hold ${lo} ${hi}`); };
+  const up  =()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); send('rel'); };
+  b.addEventListener('mousedown',down);
+  b.addEventListener('touchstart',down,{passive:false});
+  ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>b.addEventListener(ev,up));
+});
+
+// энкодер: непрерывно пока зажато
+document.querySelectorAll('button[data-rot]').forEach(b=>{
+  const cmd=b.dataset.rot; let t=null, pressed=false;
+  const down=e=>{ e.preventDefault(); if(pressed)return; pressed=true; b.classList.add('pressed'); send(cmd); t=setInterval(()=>send(cmd),150); };
+  const up  =()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); clearInterval(t); };
+  b.addEventListener('mousedown',down);
+  b.addEventListener('touchstart',down,{passive:false});
+  ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>b.addEventListener(ev,up));
+});
+
+$('#beatChk').addEventListener('change',()=> send('beat'));
+</script>
+</body>
+</html>
