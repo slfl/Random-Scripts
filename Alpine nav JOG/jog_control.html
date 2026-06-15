@@ -3,23 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JOG Control — Honda/Alpine nav</title>
+<title>JOG Control — Honda/Alpine nav (AVCLib)</title>
 <style>
   :root{ --bg:#15171c; --panel:#1e2128; --btn:#2a2e37; --btn2:#343a45;
-         --edge:#3a4150; --accent:#39c2ff; --txt:#e6e9ef; --dim:#8b93a3; --ok:#46d27a; }
+         --edge:#3a4150; --accent:#39c2ff; --txt:#e6e9ef; --dim:#8b93a3; --ok:#46d27a; --warn:#f0a93b; --err:#ff6b6b; }
   *{box-sizing:border-box; font-family:system-ui,Segoe UI,Roboto,sans-serif}
-  body{margin:0; background:var(--bg); color:var(--txt); padding:18px}
+  body{margin:0; background:var(--bg); color:var(--txt); padding:18px;
+        display:flex; flex-direction:column; align-items:center}
   h1{font-size:16px; font-weight:600; margin:0 0 12px}
+  h2{font-size:11px; text-transform:uppercase; letter-spacing:.12em; color:var(--dim); font-weight:600; margin:0 0 12px}
   .bar{display:flex; gap:10px; align-items:center; margin-bottom:16px; flex-wrap:wrap}
   button{cursor:pointer; color:var(--txt); background:var(--btn); border:1px solid var(--edge);
           border-radius:10px; padding:12px 14px; font-size:14px; user-select:none; -webkit-user-select:none}
   button:hover{background:var(--btn2)}
-  /* нажатие: ТОЛЬКО подсветка, никаких transform/сдвигов — кнопки не двигаются */
   button:active, button.pressed{ background:#2f5a78; border-color:var(--accent) }
   .pill{padding:8px 14px; border-radius:20px}
   .pill.connect{background:#1c3a2a; border-color:#2f6a48}
   .status{font-size:13px; color:var(--dim)}
-  .status.on{color:var(--ok)} .status.err{color:#ff6b6b}
+  .status.on{color:var(--ok)} .status.err{color:var(--err)}
+
+  /* ── панель пульта (прежняя раскладка) ── */
   .panel{display:grid; grid-template-columns:130px 280px 130px 110px; gap:22px; align-items:center;
           background:var(--panel); border:1px solid var(--edge); border-radius:16px; padding:24px; width:max-content}
   .col{display:flex; flex-direction:column; gap:14px}
@@ -42,111 +45,172 @@
   .bright{width:64px; height:64px; border-radius:50%; font-size:24px; padding:0}
   .eng{width:104px; font-size:12px; text-align:center; background:#3a2a14; border-color:#6a4a1f; color:#ffd9a0}
   .eng:active, .eng.pressed{ background:#6a4a1f; border-color:#ffb454 }
+
+  /* ── блоки рядом: ручная отправка + параметры линии ── */
+  .side{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:18px; width:100%; max-width:760px}
+  @media(max-width:780px){ .side{grid-template-columns:1fr} .panel{width:100%} }
+  .card{background:var(--panel); border:1px solid var(--edge); border-radius:16px; padding:18px}
+  label.f{display:flex; flex-direction:column; gap:4px; font-size:11px; color:var(--dim); margin-bottom:10px}
+  input,select{font:13px ui-monospace,Consolas,monospace; background:#11131a; color:var(--txt); border:1px solid var(--edge); border-radius:7px; padding:8px}
+  .inline{display:flex; gap:8px; align-items:flex-end}
+  .inline input{flex:1}
+  .cfg{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  .row2{display:grid; grid-template-columns:1fr 1fr; gap:8px}
+  .span2{grid-column:1/-1}
+
   .log{margin-top:16px; background:#11131a; border:1px solid var(--edge); border-radius:10px; padding:10px;
-       height:120px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; color:#a7d3ff; white-space:pre-wrap}
-  .hint{font-size:12px; color:var(--dim); margin-top:8px; max-width:680px; line-height:1.5}
+       height:240px; overflow-y:auto; scroll-behavior:smooth; font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; width:100%; max-width:760px}
+  .log .ack{color:var(--ok)} .log .nak{color:var(--warn)} .log .si{color:var(--err)} .log .tx{color:var(--accent)} .log .rx{color:#a7d3ff}
+  .hint{font-size:12px; color:var(--dim); margin-top:10px; width:100%; max-width:760px; line-height:1.5}
   label.beat{display:flex; gap:6px; align-items:center; font-size:13px; color:var(--dim)}
 </style>
 </head>
 <body>
-  <h1>JOG Control — эмулятор пульта навигации</h1>
+  <h1>JOG Control — эмулятор пульта навигации (AVCLib)</h1>
   <div class="bar">
     <button class="pill connect" id="connectBtn">Подключить Arduino</button>
     <span class="status" id="status">не подключено</span>
-    <label class="beat"><input type="checkbox" id="beatChk"> heartbeat (старт блока)</label>
+    <label class="beat"><input type="checkbox" id="holdRep" checked> повтор кадра при удержании</label>
   </div>
 
   <div class="panel">
     <div class="col">
-      <button data-lo="01" data-hi="00">MAP</button>
-      <button data-lo="04" data-hi="00">CLIMATE</button>
-      <button data-lo="00" data-hi="20">BACK ↩</button>
+      <button data-id="" data-pl="01 00">MAP</button>
+      <button data-id="" data-pl="04 00">CLIMATE</button>
+      <button data-id="" data-pl="00 20">BACK ↩</button>
     </div>
 
     <div>
       <div class="jog">
         <div class="ring"></div>
-        <button class="dir up"    data-lo="00" data-hi="08">▲</button>
-        <button class="dir down"  data-lo="00" data-hi="02">▼</button>
-        <button class="dir left"  data-lo="00" data-hi="01">◀</button>
-        <button class="dir right" data-lo="00" data-hi="04">▶</button>
-        <button class="ent"       data-lo="40" data-hi="00">PUSH<br>ENT</button>
+        <button class="dir up"    data-id="" data-pl="00 08">▲</button>
+        <button class="dir down"  data-id="" data-pl="00 02">▼</button>
+        <button class="dir left"  data-id="" data-pl="00 01">◀</button>
+        <button class="dir right" data-id="" data-pl="00 04">▶</button>
+        <button class="ent"       data-id="" data-pl="40 00">PUSH<br>ENT</button>
       </div>
       <div class="rot">
-        <button data-rot="ccw">↺ CCW</button>
-        <button data-rot="cw">↻ CW</button>
+        <button data-id="ff" data-pl="">↺ CCW</button>
+        <button data-id="81" data-pl="">↻ CW</button>
       </div>
     </div>
 
     <div class="col">
-      <button data-lo="20" data-hi="00">MENU</button>
-      <button data-lo="00" data-hi="40">AUDIO</button>
-      <button data-lo="10" data-hi="00">INFO</button>
+      <button data-id="" data-pl="20 00">MENU</button>
+      <button data-id="" data-pl="00 40">AUDIO</button>
+      <button data-id="" data-pl="10 00">INFO</button>
     </div>
 
     <div class="extra">
-      <button class="bright" data-lo="02" data-hi="00" title="Яркость">☀</button>
-      <button class="eng" data-lo="21" data-hi="00">Инженерное меню</button>
+      <button class="bright" data-id="" data-pl="02 00" title="Яркость">☀</button>
+      <button class="eng" data-id="" data-pl="21 20" title="BACK + MAP + MENU одновременно">Инженерное меню</button>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <h2>Ручная отправка</h2>
+      <label class="f">FRAME — id + payload (hex)
+        <div class="inline"><input id="fId" value="80" style="max-width:64px"><input id="fPl" value="01" placeholder="01 00"><button id="fSend">послать</button></div>
+      </label>
+      <label class="f">RAW — сырые байты (без обёртки)
+        <div class="inline"><input id="rRaw" placeholder="01 80 02 01 01 00"><button id="rSend">послать</button></div>
+      </label>
+      <div class="row2">
+        <button id="scan">SCAN линию</button>
+        <button id="mon">MON слушать</button>
+      </div>
+      <p class="hint">SCAN перебирает инверсию × порядок бит × скорость и ищет ответ ACK 0x06 — самый быстрый способ зафиксировать линию.</p>
+    </div>
+
+    <div class="card">
+      <h2>Параметры линии</h2>
+      <div class="cfg">
+        <label class="f">bit, мкс<input id="c_bit" value="208"></label>
+        <label class="f">gap, мкс<input id="c_gap" value="800"></label>
+        <label class="f">inverted<select id="c_inv"><option value="1">да</option><option value="0">нет</option></select></label>
+        <label class="f">порядок бит<select id="c_msb"><option value="0">LSB</option><option value="1">MSB</option></select></label>
+        <label class="f">выход<select id="c_drive"><option value="pp">push-pull</option><option value="od">open-drain</option></select></label>
+        <label class="f">ACK timeout, мс<input id="c_acktmo" value="25"></label>
+        <label class="f">повторов<input id="c_retry" value="3"></label>
+        <label class="f">ID по умолч. (hex)<input id="c_id" value="80"></label>
+        <div class="span2"><button id="applyCfg" class="pill connect" style="width:100%">Применить</button></div>
+      </div>
     </div>
   </div>
 
   <div class="log" id="log"></div>
   <div class="hint">
-    Открой в <b>Chrome</b> или <b>Edge</b>. Закрой Serial Monitor в Arduino IDE (порт занимает одна программа).
-    «Подключить Arduino» → выбери COM‑порт. Любую кнопку можно <b>держать</b> — пока зажата, нажатие активно;
-    отпустил — отпустилось. Энкодер ↺/↻ при удержании крутит непрерывно. Порт 9600.
+    Открой в <b>Chrome</b>/<b>Edge</b>, закрой Serial Monitor в Arduino IDE. «Подключить» → выбери COM-порт (115200).
+    Кнопку можно <b>держать</b> — кадр повторяется (как настоящий JOG ~каждые 120&nbsp;мс), отпустил — тишина. Энкодер ↺/↻ при удержании крутит.
+    Кнопки шлют <code>FRAME id payload</code>; id берётся из «ID по умолч.», payload — из подписи кнопки. Смотри ответ: <span class="ack">ACK</span> / <span class="nak">NAK</span> / тишина.
   </div>
 
 <script>
 let port=null, writer=null, reader=null;
 const $=s=>document.querySelector(s);
 const logEl=$('#log'), statusEl=$('#status');
-function log(t){ logEl.textContent+=t+"\n"; logEl.scrollTop=logEl.scrollHeight; }
+function add(t,cls){ const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=t; logEl.appendChild(s); logEl.scrollTop=logEl.scrollHeight; }
 function setStatus(t,cls){ statusEl.textContent=t; statusEl.className='status '+(cls||''); }
+function classify(l){ if(l.includes('ACK'))return 'ack'; if(l.includes('NAK'))return 'nak'; if(l.includes('тишина'))return 'si'; return 'rx'; }
 
 async function connect(){
+  if(port){ await disconnect(); return; }
   if(!('serial' in navigator)){ setStatus('Web Serial не поддерживается (нужен Chrome/Edge)','err'); return; }
   try{
     port = await navigator.serial.requestPort();
-    await port.open({ baudRate:9600 });
+    await port.open({ baudRate:115200 });
     writer = port.writable.getWriter();
-    setStatus('подключено','on'); readLoop();
-  }catch(e){ setStatus('ошибка: '+e.message,'err'); }
+    setStatus('подключено','on'); $('#connectBtn').textContent='Отключить';
+    const dec=new TextDecoderStream(); port.readable.pipeTo(dec.writable);
+    reader=dec.readable.getReader(); let buf='';
+    (async()=>{ try{ while(true){ const {value,done}=await reader.read(); if(done)break;
+      buf+=value; let i; while((i=buf.indexOf('\n'))>=0){ const ln=buf.slice(0,i); buf=buf.slice(i+1); add(ln+'\n',classify(ln)); } }
+    }catch(e){} })();
+  }catch(e){ setStatus('ошибка: '+e.message,'err'); port=null; }
 }
-async function readLoop(){
-  try{
-    reader = port.readable.getReader();
-    const dec=new TextDecoder();
-    while(true){ const {value,done}=await reader.read(); if(done)break; if(value) logEl.textContent+=dec.decode(value); }
-  }catch(e){}
+async function disconnect(){
+  try{ if(reader){await reader.cancel().catch(()=>{});} if(writer){writer.releaseLock();} if(port){await port.close();} }catch(e){}
+  port=null;writer=null;reader=null; setStatus('не подключено',''); $('#connectBtn').textContent='Подключить Arduino';
 }
 async function send(cmd){
   if(!writer){ setStatus('сначала подключи Arduino','err'); return; }
-  try{ await writer.write(new TextEncoder().encode(cmd+"\n")); log("> "+cmd); }catch(e){ setStatus('порт закрыт','err'); }
+  try{ await writer.write(new TextEncoder().encode(cmd+"\n")); add('› '+cmd+'\n','tx'); }catch(e){ setStatus('порт закрыт','err'); }
 }
 $('#connectBtn').addEventListener('click', connect);
 
-// кнопки: удержание hold..rel
-document.querySelectorAll('button[data-lo]').forEach(b=>{
-  const lo=b.dataset.lo, hi=b.dataset.hi; let pressed=false;
-  const down=e=>{ e.preventDefault(); if(pressed)return; pressed=true; b.classList.add('pressed'); send(`hold ${lo} ${hi}`); };
-  const up  =()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); send('rel'); };
+// FRAME-команда для кнопки: id из data-id (или глобальный), payload из data-pl
+function frameCmd(b){
+  const id = (b.dataset.id && b.dataset.id.trim()) ? b.dataset.id.trim() : $('#c_id').value.trim();
+  const pl = (b.dataset.pl||'').trim();
+  return ('FRAME '+id+(pl?(' '+pl):'')).trim();
+}
+
+// кнопки/энкодер: удержание = повтор кадра (как настоящий JOG)
+document.querySelectorAll('.panel button[data-pl], .panel button[data-id]').forEach(b=>{
+  let t=null, pressed=false;
+  const isRot = b.parentElement.classList.contains('rot');
+  const period = isRot ? 150 : 120;
+  const down=e=>{ e.preventDefault(); if(pressed)return; pressed=true; b.classList.add('pressed');
+    const cmd=frameCmd(b); send(cmd);
+    if($('#holdRep').checked) t=setInterval(()=>send(cmd), period);
+  };
+  const up=()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); clearInterval(t); };
   b.addEventListener('mousedown',down);
   b.addEventListener('touchstart',down,{passive:false});
   ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>b.addEventListener(ev,up));
 });
 
-// энкодер: непрерывно пока зажато
-document.querySelectorAll('button[data-rot]').forEach(b=>{
-  const cmd=b.dataset.rot; let t=null, pressed=false;
-  const down=e=>{ e.preventDefault(); if(pressed)return; pressed=true; b.classList.add('pressed'); send(cmd); t=setInterval(()=>send(cmd),150); };
-  const up  =()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); clearInterval(t); };
-  b.addEventListener('mousedown',down);
-  b.addEventListener('touchstart',down,{passive:false});
-  ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>b.addEventListener(ev,up));
+// ручная отправка / линия
+$('#fSend').addEventListener('click',()=>send('FRAME '+$('#fId').value.trim()+' '+$('#fPl').value.trim()));
+$('#rSend').addEventListener('click',()=>send('RAW '+$('#rRaw').value.trim()));
+$('#scan').addEventListener('click',()=>send('SCAN '+$('#fId').value.trim()+' '+($('#fPl').value.trim()||'01')));
+$('#mon').addEventListener('click',()=>send('MON 4000'));
+$('#applyCfg').addEventListener('click',()=>{
+  const v=id=>$('#'+id).value;
+  send(`CFG bit=${v('c_bit')} gap=${v('c_gap')} inv=${v('c_inv')} msb=${v('c_msb')} drive=${v('c_drive')} acktmo=${v('c_acktmo')} retry=${v('c_retry')} id=${v('c_id')}`);
 });
-
-$('#beatChk').addEventListener('change',()=> send('beat'));
+if(!('serial' in navigator)) add('[Web Serial не поддерживается — открой в Chrome/Edge]\n','si');
 </script>
 </body>
 </html>
