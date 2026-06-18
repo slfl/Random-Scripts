@@ -1,0 +1,928 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+// ====== Глобальные настройки (из config.ini) ======
+
+var (
+	cfgLogin      string
+	cfgPassword   string
+	cfgResolution string
+	cfgTheme      string
+	cfgSaveDir    string
+	cfgMaxFiles   int
+	cfgLikeEveryN int
+	cfgMaxAttempt int
+	cfgNotify     bool
+
+	likeDir        string
+	sectionBaseURL string
+	loginURL       string
+	configPath     string
+)
+
+const (
+	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+	quotaMarker   = "исчерпали возможное количество скачанных"
+	quotaMarker2  = "download_limit"
+	baseSiteCom   = "https://www.goodfon.com"
+	httpTimeout   = 15 * time.Second
+	probeTimeout  = 8 * time.Second
+)
+
+// errQuota — специальная ошибка превышения суточного лимита.
+var errQuota = fmt.Errorf("download limit reached")
+
+// ====== Логирование ======
+
+var logOut io.Writer = os.Stdout
+
+func logf(level, format string, a ...interface{}) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	fmt.Fprintf(logOut, "%s %s: %s\n", ts, level, fmt.Sprintf(format, a...))
+}
+func logInfo(f string, a ...interface{})  { logf("INFO", f, a...) }
+func logWarn(f string, a ...interface{})  { logf("WARNING", f, a...) }
+func logError(f string, a ...interface{}) { logf("ERROR", f, a...) }
+
+// ====== Конфиг (INI, без внешних библиотек) ======
+
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		wd, _ := os.Getwd()
+		return wd
+	}
+	return filepath.Dir(exe)
+}
+
+func loadConfig() error {
+	configPath = filepath.Join(exeDir(), "config.ini")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("файл конфигурации не найден: %s", configPath)
+	}
+
+	sections := map[string]map[string]string{}
+	cur := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, ";") || strings.HasPrefix(t, "#") {
+			continue
+		}
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			cur = strings.ToLower(strings.TrimSpace(t[1 : len(t)-1]))
+			sections[cur] = map[string]string{}
+			continue
+		}
+		if eq := strings.Index(t, "="); eq >= 0 && cur != "" {
+			k := strings.ToLower(strings.TrimSpace(t[:eq]))
+			v := strings.TrimSpace(t[eq+1:])
+			sections[cur][k] = v
+		}
+	}
+
+	get := func(sec, key string) string {
+		if m, ok := sections[sec]; ok {
+			return m[key]
+		}
+		return ""
+	}
+	atoiOr := func(s string, def int) int {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+			return n
+		}
+		return def
+	}
+
+	cfgLogin = get("auth", "login")
+	cfgPassword = get("auth", "password")
+	cfgResolution = get("settings", "resolution")
+	cfgTheme = get("settings", "theme")
+	cfgSaveDir = get("settings", "save_dir")
+	cfgMaxFiles = atoiOr(get("settings", "max_files"), 10)
+	cfgLikeEveryN = atoiOr(get("settings", "like_every_n"), 10)
+	cfgMaxAttempt = atoiOr(get("settings", "max_attempts"), 3)
+	cfgNotify = strings.EqualFold(strings.TrimSpace(get("settings", "notify")), "true")
+
+	if cfgSaveDir == "" || cfgTheme == "" {
+		return fmt.Errorf("в config.ini не заданы save_dir или theme")
+	}
+
+	likeDir = filepath.Join(cfgSaveDir, "Like", cfgTheme)
+	sectionBaseURL = fmt.Sprintf("%s/%s/", baseSiteCom, cfgTheme)
+	loginURL = baseSiteCom + "/auth/signin/"
+	return nil
+}
+
+func readCounter() int {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return 0
+	}
+	re := regexp.MustCompile(`(?mi)^\s*counter\s*=\s*(\d+)`)
+	if m := re.FindStringSubmatch(string(data)); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	return 0
+}
+
+func writeCounter(value int) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	text := string(data)
+	re := regexp.MustCompile(`(?mi)^(\s*counter\s*=\s*)\d+`)
+	if re.MatchString(text) {
+		text = re.ReplaceAllString(text, "${1}"+strconv.Itoa(value))
+	} else {
+		// секции [state] нет — добавляем
+		if !strings.Contains(strings.ToLower(text), "[state]") {
+			text = strings.TrimRight(text, "\n") + "\n\n[state]\n"
+		}
+		text = strings.TrimRight(text, "\n") + "\ncounter = " + strconv.Itoa(value) + "\n"
+	}
+	_ = os.WriteFile(configPath, []byte(text), 0644)
+}
+
+// ====== Уведомления в трей (через встроенный в Windows toast) ======
+
+func notify(title, msg string) {
+	if !cfgNotify {
+		return
+	}
+	// Экранируем для XML (имена файлов и заголовки)
+	escXML := func(s string) string {
+		s = strings.ReplaceAll(s, "&", "&amp;")
+		s = strings.ReplaceAll(s, "<", "&lt;")
+		s = strings.ReplaceAll(s, ">", "&gt;")
+		s = strings.ReplaceAll(s, "\"", "&quot;")
+		return s
+	}
+
+	script := `$ErrorActionPreference='SilentlyContinue'
+$appId='GoodFon'
+$reg="HKCU:\Software\Classes\AppUserModelId\$appId"
+if(-not(Test-Path $reg)){New-Item -Path $reg -Force|Out-Null}
+New-ItemProperty -Path $reg -Name DisplayName -Value 'GoodFon' -PropertyType String -Force|Out-Null
+[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null
+[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]>$null
+$xmlString=@"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>` + escXML(title) + `</text>
+      <text>` + escXML(msg) + `</text>
+    </binding>
+  </visual>
+</toast>
+"@
+$xml=New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($xmlString)
+$toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)`
+
+	// Пишем скрипт во временный .ps1 с UTF-8 BOM, чтобы кириллица читалась корректно.
+	tmp := filepath.Join(os.TempDir(), "goodfon_toast.ps1")
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	if err := os.WriteFile(tmp, append(bom, []byte(script)...), 0644); err != nil {
+		logWarn("Не удалось записать toast-скрипт: %v", err)
+		return
+	}
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Run(); err != nil {
+		logWarn("Не удалось показать уведомление: %v", err)
+	}
+}
+
+// ====== Установка обоев через user32.dll ======
+
+var (
+	user32              = syscall.NewLazyDLL("user32.dll")
+	procSystemParamInfo = user32.NewProc("SystemParametersInfoW")
+
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
+	procAttachConsole    = kernel32.NewProc("AttachConsole")
+)
+
+const attachParentProcess = ^uintptr(0) // (DWORD)-1
+
+// parseArgs разбирает аргументы: действие (update/like/unlike) и флаг -logfile.
+// Принимает как "like", так и "-like"; порядок не важен.
+func parseArgs() (action string, logFile bool) {
+	action = "update"
+	actionSet := false
+	for _, a := range os.Args[1:] {
+		al := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"))
+		switch al {
+		case "logfile", "log":
+			logFile = true
+		case "like", "unlike", "update":
+			if !actionSet {
+				action = al
+				actionSet = true
+			}
+		}
+	}
+	return
+}
+
+// setupOutput направляет логи: в консоль терминала (если запущено из него),
+// иначе — в файл goodfon.log при наличии флага -logfile, иначе никуда.
+func setupOutput(logFile bool) {
+	if r, _, _ := procAttachConsole.Call(attachParentProcess); r != 0 {
+		if f, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+			logOut = f
+			return
+		}
+	}
+	if !logFile {
+		logOut = io.Discard
+		return
+	}
+	logPath := filepath.Join(exeDir(), "goodfon.log")
+	// Простой ограничитель: если файл перерос 1 МБ — обнуляем перед записью.
+	if fi, err := os.Stat(logPath); err == nil && fi.Size() > 1<<20 {
+		_ = os.Truncate(logPath, 0)
+	}
+	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		logOut = f
+	} else {
+		logOut = io.Discard
+	}
+}
+
+const (
+	spiSetDeskWallpaper = 0x0014
+	spiGetDeskWallpaper = 0x0073
+	spifUpdateINIFile   = 0x01
+	spifSendChange      = 0x02
+)
+
+func setWallpaper(path string) error {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	r, _, e := procSystemParamInfo.Call(
+		spiSetDeskWallpaper, 0,
+		uintptr(unsafe.Pointer(p)),
+		spifUpdateINIFile|spifSendChange,
+	)
+	if r == 0 {
+		return e
+	}
+	logInfo("Обои выставлены: %s", path)
+	return nil
+}
+
+func getCurrentWallpaper() string {
+	buf := make([]uint16, 520)
+	procSystemParamInfo.Call(
+		spiGetDeskWallpaper,
+		uintptr(len(buf)),
+		uintptr(unsafe.Pointer(&buf[0])),
+		0,
+	)
+	return syscall.UTF16ToString(buf)
+}
+
+// ====== HTTP-клиент ======
+
+func newClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{Jar: jar, Timeout: httpTimeout}
+}
+
+func httpGet(c *http.Client, u, referer string) (string, int, error) {
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", resp.StatusCode, err
+	}
+	return string(body), resp.StatusCode, nil
+}
+
+func httpGetBytes(c *http.Client, u, referer string) ([]byte, string, int, error) {
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return body, resp.Header.Get("Content-Type"), resp.StatusCode, err
+}
+
+// ====== Авторизация ======
+
+var reCSRF = regexp.MustCompile(`(?s)<input[^>]*csrfmiddlewaretoken[^>]*>`)
+var reValue = regexp.MustCompile(`value="([^"]*)"`)
+
+func login(c *http.Client) error {
+	html, _, err := httpGet(c, loginURL, "")
+	if err != nil {
+		return err
+	}
+	token := ""
+	if tag := reCSRF.FindString(html); tag != "" {
+		if m := reValue.FindStringSubmatch(tag); m != nil {
+			token = m[1]
+		}
+	}
+
+	form := url.Values{}
+	form.Set("csrfmiddlewaretoken", token)
+	form.Set("login", cfgLogin)
+	form.Set("password", cfgPassword)
+
+	req, _ := http.NewRequest("POST", loginURL, strings.NewReader(form.Encode()))
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", loginURL)
+	if token != "" {
+		req.Header.Set("X-CSRFToken", token)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 || strings.Contains(string(body), "Incorrect password") {
+		return fmt.Errorf("неверный логин или пароль")
+	}
+	logInfo("Авторизация успешна")
+	return nil
+}
+
+func isSiteAvailable() bool {
+	c := &http.Client{Timeout: probeTimeout}
+	req, _ := http.NewRequest("GET", sectionBaseURL, nil)
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := c.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode < 500
+}
+
+// ====== Пагинация и сбор ссылок ======
+
+var reIndexPage = regexp.MustCompile(`index-(\d+)\.html`)
+
+func getMaxPages(c *http.Client) (int, error) {
+	html, status, err := httpGet(c, sectionBaseURL, "")
+	if err != nil {
+		return 0, err
+	}
+	if status != 200 {
+		return 0, fmt.Errorf("первая страница вернула статус %d", status)
+	}
+	max := 1
+	for _, m := range reIndexPage.FindAllStringSubmatch(html, -1) {
+		if n, e := strconv.Atoi(m[1]); e == nil && n > max {
+			max = n
+		}
+	}
+	if max <= 1 {
+		return 0, fmt.Errorf("пагинация не найдена")
+	}
+	return max, nil
+}
+
+func randomPageURL(maxPages int) string {
+	n := rand.Intn(maxPages) + 1
+	if n == 1 {
+		return sectionBaseURL
+	}
+	return fmt.Sprintf("%sindex-%d.html", sectionBaseURL, n)
+}
+
+var reWallpaperLink = regexp.MustCompile(`href="(/[^"]*?/wallpaper-[^"]*?\.html)"`)
+
+func collectWallpaperLinks(html string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range reWallpaperLink.FindAllStringSubmatch(html, -1) {
+		href := m[1]
+		if strings.Contains(href, "wallpaper-download") {
+			continue
+		}
+		if !seen[href] {
+			seen[href] = true
+			out = append(out, href)
+		}
+	}
+	return out
+}
+
+// ====== Поиск и скачивание картинки ======
+
+func findDownloadURL(c *http.Client, imagePageURL string) (string, error) {
+	html, status, err := httpGet(c, imagePageURL, sectionBaseURL)
+	if err != nil {
+		return "", err
+	}
+	if status != 200 {
+		logWarn("Страница изображения вернула статус %d: %s", status, imagePageURL)
+		return "", nil
+	}
+
+	// Строго ищем ссылку с нужным разрешением (с дефисом в конце).
+	pat := regexp.MustCompile(`href="([^"]*wallpaper-download-` + regexp.QuoteMeta(cfgResolution) + `-[^"]*\.html)"`)
+	m := pat.FindStringSubmatch(html)
+	if m == nil {
+		logInfo("Разрешение %s недоступно для этой картинки, пропускаем.", cfgResolution)
+		return "", nil
+	}
+	downloadPageURL := resolveURL(imagePageURL, m[1])
+
+	dhtml, dstatus, err := httpGet(c, downloadPageURL, imagePageURL)
+	if err != nil {
+		return "", err
+	}
+	if dstatus != 200 {
+		return "", nil
+	}
+
+	if strings.Contains(dhtml, quotaMarker) || strings.Contains(dhtml, quotaMarker2) {
+		logWarn("Превышен суточный лимит скачиваний на сайте.")
+		return "", errQuota
+	}
+
+	// Ссылка на оригинал в <a class="js-download_img" href="...">
+	reDl := regexp.MustCompile(`(<a[^>]*js-download_img[^>]*>)`)
+	if tag := reDl.FindString(dhtml); tag != "" {
+		if hm := regexp.MustCompile(`href="([^"]+)"`).FindStringSubmatch(tag); hm != nil {
+			if strings.Contains(hm[1], "img.goodfon") {
+				return hm[1], nil
+			}
+		}
+	}
+	// Запасной вариант — img с img.goodfon
+	if im := regexp.MustCompile(`<img[^>]*src="([^"]*img\.goodfon[^"]*)"`).FindStringSubmatch(dhtml); im != nil {
+		return im[1], nil
+	}
+
+	logWarn("Ссылка на картинку не найдена на странице загрузки: %s", downloadPageURL)
+	return "", nil
+}
+
+func downloadImage(c *http.Client, finalURL string) []byte {
+	tryURLs := []string{finalURL}
+	if strings.Contains(finalURL, "img.goodfon.com") {
+		tryURLs = append(tryURLs, strings.Replace(finalURL, "img.goodfon.com", "img.goodfon.ru", 1))
+	} else if strings.Contains(finalURL, "img.goodfon.ru") {
+		tryURLs = append(tryURLs, strings.Replace(finalURL, "img.goodfon.ru", "img.goodfon.com", 1))
+	}
+
+	for _, u := range tryURLs {
+		body, ctype, status, err := httpGetBytes(c, u, "")
+		if err != nil {
+			logWarn("Не удалось скачать с %s: %v", u, err)
+			continue
+		}
+		if status == 200 && strings.Contains(ctype, "image") {
+			if u != finalURL {
+				logInfo("Использован резервный img домен: %s", u)
+			}
+			return body
+		}
+	}
+	return nil
+}
+
+func saveImage(finalURL string, content []byte) (string, error) {
+	if err := os.MkdirAll(cfgSaveDir, 0755); err != nil {
+		return "", err
+	}
+	u, _ := url.Parse(finalURL)
+	name := filepath.Base(u.Path)
+	if i := strings.Index(name, "?"); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.ReplaceAll(name, " ", "_")
+	path := filepath.Join(cfgSaveDir, name)
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		return "", err
+	}
+	logInfo("Файл сохранён: %s", path)
+	return path, nil
+}
+
+func cleanupOldImages() {
+	files := filesInDir(cfgSaveDir)
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	if len(files) > cfgMaxFiles {
+		for _, f := range files[:len(files)-cfgMaxFiles] {
+			if err := os.Remove(f.path); err != nil {
+				logWarn("Не удалось удалить файл %s: %v", f.path, err)
+			} else {
+				logInfo("Удалён старый файл: %s", f.path)
+			}
+		}
+	}
+}
+
+// ====== Вспомогательные функции по файлам ======
+
+type fileInfo struct {
+	path string
+	mod  time.Time
+}
+
+func filesInDir(dir string) []fileInfo {
+	var out []fileInfo
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, fileInfo{filepath.Join(dir, e.Name()), info.ModTime()})
+	}
+	return out
+}
+
+func lastInDir(dir string) string {
+	files := filesInDir(dir)
+	if len(files) == 0 {
+		return ""
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	return files[len(files)-1].path
+}
+
+func randomFileExcluding(dir, exclude string) string {
+	files := filesInDir(dir)
+	if len(files) == 0 {
+		return ""
+	}
+	var cand []string
+	for _, f := range files {
+		if !strings.EqualFold(f.path, exclude) {
+			cand = append(cand, f.path)
+		}
+	}
+	if len(cand) == 0 {
+		return files[rand.Intn(len(files))].path
+	}
+	return cand[rand.Intn(len(cand))]
+}
+
+// ====== Like / Unlike ======
+
+func resolveURL(base, ref string) string {
+	b, err := url.Parse(base)
+	if err != nil {
+		return ref
+	}
+	r, err := url.Parse(ref)
+	if err != nil {
+		return ref
+	}
+	return b.ResolveReference(r).String()
+}
+
+var reAddURL = regexp.MustCompile(`data-add="([^"]+)"`)
+var reDelURL = regexp.MustCompile(`data-del="([^"]+)"`)
+
+func getFavoriteIDs(c *http.Client, imagePageURL string) (addURL, delURL string) {
+	html, status, err := httpGet(c, imagePageURL, "")
+	if err != nil || status != 200 {
+		logWarn("Не удалось открыть страницу картинки: %s", imagePageURL)
+		return "", ""
+	}
+	// Берём блок js-favorite
+	favRe := regexp.MustCompile(`(<a[^>]*js-favorite[^>]*>)`)
+	tag := favRe.FindString(html)
+	if tag == "" {
+		logWarn("Блок избранного не найден на странице: %s", imagePageURL)
+		return "", ""
+	}
+	if m := reAddURL.FindStringSubmatch(tag); m != nil {
+		addURL = m[1]
+	}
+	if m := reDelURL.FindStringSubmatch(tag); m != nil {
+		delURL = m[1]
+	}
+	return addURL, delURL
+}
+
+func nameOnly(path string) string {
+	b := filepath.Base(path)
+	return strings.TrimSuffix(b, filepath.Ext(b))
+}
+
+func addToLike(c *http.Client) {
+	last := lastInDir(cfgSaveDir)
+	if last == "" {
+		logError("Нет последнего скачанного файла.")
+		return
+	}
+	name := filepath.Base(last)
+	_ = os.MkdirAll(likeDir, 0755)
+	dest := filepath.Join(likeDir, name)
+	if _, err := os.Stat(dest); os.IsNotExist(err) {
+		if err := copyFile(last, dest); err != nil {
+			logError("Не удалось скопировать в Like: %v", err)
+			return
+		}
+		logInfo("Изображение скопировано в папку Like/%s: %s", cfgTheme, dest)
+	} else {
+		logInfo("Изображение уже есть в папке Like/%s", cfgTheme)
+	}
+
+	// Переставляем обои на копию из Like, чтобы unlike работал корректно
+	_ = setWallpaper(dest)
+	logInfo("Обои переключены на копию из Like/%s", cfgTheme)
+
+	imagePageURL := fmt.Sprintf("%s/%s/wallpaper-%s.html", baseSiteCom, cfgTheme, nameOnly(name))
+	addURL, _ := getFavoriteIDs(c, imagePageURL)
+	if addURL != "" {
+		_, status, _ := httpGet(c, resolveURL(baseSiteCom, addURL), imagePageURL)
+		if status == 200 {
+			logInfo("Изображение добавлено в избранное на сайте: %s", name)
+			notify("Добавлено в избранное", name)
+		} else {
+			logWarn("Ошибка добавления в избранное: статус %d", status)
+		}
+	} else {
+		logWarn("Не найден элемент для добавления в избранное.")
+	}
+}
+
+func removeFromLike(c *http.Client) bool {
+	current := getCurrentWallpaper()
+	if current == "" {
+		logError("Не удалось определить текущие обои.")
+		return false
+	}
+	if !strings.HasPrefix(strings.ToLower(current), strings.ToLower(likeDir)) {
+		logError("Текущие обои не из папки Like/%s: %s", cfgTheme, current)
+		logError("Unlike работает только когда установлена картинка из избранного.")
+		notify("GoodFon: ошибка", "Текущие обои не из папки избранного.")
+		return false
+	}
+
+	name := filepath.Base(current)
+	logInfo("Удаляем из избранного: %s", name)
+
+	imagePageURL := fmt.Sprintf("%s/%s/wallpaper-%s.html", baseSiteCom, cfgTheme, nameOnly(name))
+	_, delURL := getFavoriteIDs(c, imagePageURL)
+	if delURL != "" {
+		_, status, _ := httpGet(c, resolveURL(baseSiteCom, delURL), imagePageURL)
+		if status == 200 {
+			logInfo("Изображение удалено из избранного на сайте: %s", name)
+		} else {
+			logWarn("Ошибка удаления из избранного: статус %d", status)
+		}
+	} else {
+		logWarn("Не найден элемент для удаления из избранного.")
+	}
+
+	if err := os.Remove(current); err != nil {
+		logError("Не удалось удалить файл %s: %v", current, err)
+		return false
+	}
+	logInfo("Файл удалён из папки Like/%s: %s", cfgTheme, name)
+	notify("Удалено из избранного", name)
+	return true
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
+}
+
+// ====== Локальный fallback ======
+
+func setWallpaperFromLike() bool {
+	files := filesInDir(likeDir)
+	if len(files) == 0 {
+		logWarn("Папка Like/%s пуста, загружаем с сайта", cfgTheme)
+		return false
+	}
+	chosen := randomFileExcluding(likeDir, getCurrentWallpaper())
+	_ = setWallpaper(chosen)
+	logInfo("Обои из папки Like/%s: %s", cfgTheme, chosen)
+	notify("Обои обновлены — из избранного", filepath.Base(chosen))
+	return true
+}
+
+func fallbackLocal(likeOnly bool) {
+	dir := likeDir
+	files := filesInDir(likeDir)
+	if !likeOnly && len(files) == 0 {
+		dir = cfgSaveDir
+		files = filesInDir(cfgSaveDir)
+	}
+	if len(files) == 0 {
+		logWarn("Fallback: локальных картинок нет, обои не изменены.")
+		notify("GoodFon: ошибка", "Нет доступных картинок.")
+		return
+	}
+	chosen := randomFileExcluding(dir, getCurrentWallpaper())
+	logInfo("Fallback: устанавливаем локальную картинку: %s", chosen)
+	_ = setWallpaper(chosen)
+	if likeOnly {
+		notify("Обои обновлены — из избранного", filepath.Base(chosen))
+	} else {
+		notify("Обои обновлены — локально", filepath.Base(chosen))
+	}
+}
+
+// ====== main ======
+
+func main() {
+	arg, logFile := parseArgs()
+	setupOutput(logFile)
+	rand.Seed(time.Now().UnixNano())
+
+	if err := loadConfig(); err != nil {
+		logError("%v", err)
+		return
+	}
+
+	// Проверка доступности сайта до логина
+	if !isSiteAvailable() {
+		logWarn("Сайт недоступен, пропускаем авторизацию.")
+		if arg == "like" || arg == "unlike" {
+			notify("GoodFon: сайт недоступен", "Операция с избранным невозможна.")
+			return
+		}
+		writeCounter(readCounter() + 1)
+		fallbackLocal(false)
+		return
+	}
+
+	client := newClient()
+	if err := login(client); err != nil {
+		logError("Ошибка логина: %v", err)
+		fallbackLocal(false)
+		return
+	}
+
+	switch arg {
+	case "like":
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logError("Ошибка при добавлении в избранное: %v", r)
+					notify("GoodFon: ошибка", "Не удалось добавить в избранное.")
+				}
+			}()
+			addToLike(client)
+		}()
+		return
+	case "unlike":
+		ok := func() bool {
+			defer func() {
+				if r := recover(); r != nil {
+					logError("Ошибка при удалении из избранного: %v", r)
+				}
+			}()
+			return removeFromLike(client)
+		}()
+		if !ok {
+			return
+		}
+		logInfo("Загружаем новую картинку с сайта после удаления из избранного.")
+	}
+
+	// Счётчик: каждый LIKE_EVERY_N-й запуск берём из Like
+	counter := readCounter() + 1
+	writeCounter(counter)
+	logInfo("Запуск #%d (из Like каждые %d)", counter, cfgLikeEveryN)
+
+	if counter >= cfgLikeEveryN {
+		writeCounter(0)
+		if setWallpaperFromLike() {
+			return
+		}
+		logInfo("Папка Like пуста, продолжаем загрузку с сайта")
+	}
+
+	// Загрузка с сайта
+	maxPages := 0
+	for attempt := 1; attempt <= cfgMaxAttempt; attempt++ {
+		logInfo("Попытка %d из %d", attempt, cfgMaxAttempt)
+
+		if maxPages == 0 {
+			mp, err := getMaxPages(client)
+			if err != nil {
+				logWarn("Ошибка пагинации при попытке %d: %v", attempt, err)
+				continue
+			}
+			maxPages = mp
+			logInfo("Максимальное количество страниц: %d", maxPages)
+		}
+
+		pageURL := randomPageURL(maxPages)
+		logInfo("Выбрана страница раздела: %s", pageURL)
+
+		html, status, err := httpGet(client, pageURL, "")
+		if err != nil {
+			logError("Ошибка при попытке %d: %v", attempt, err)
+			continue
+		}
+		if status != 200 {
+			logWarn("Страница вернула статус %d", status)
+			continue
+		}
+
+		links := collectWallpaperLinks(html)
+		if len(links) == 0 {
+			logWarn("На странице нет обоев, пробуем другую")
+			continue
+		}
+
+		imagePageURL := resolveURL(sectionBaseURL, links[rand.Intn(len(links))])
+		logInfo("Выбрана страница изображения: %s", imagePageURL)
+
+		finalURL, err := findDownloadURL(client, imagePageURL)
+		if err == errQuota {
+			logWarn("Суточный лимит скачиваний исчерпан, переходим на локальные картинки.")
+			notify("GoodFon: лимит исчерпан", "Загружаем из избранного.")
+			fallbackLocal(true)
+			return
+		}
+		if err != nil {
+			logError("Ошибка при попытке %d: %v", attempt, err)
+			continue
+		}
+		if finalURL == "" {
+			logWarn("Ссылка на скачивание не найдена, пробуем другую")
+			continue
+		}
+
+		content := downloadImage(client, finalURL)
+		if content == nil {
+			logWarn("Не удалось скачать картинку, пробуем другую")
+			continue
+		}
+
+		savedPath, err := saveImage(finalURL, content)
+		if err != nil {
+			logError("Ошибка сохранения: %v", err)
+			continue
+		}
+		cleanupOldImages()
+		_ = setWallpaper(savedPath)
+		notify("Обои обновлены — с сайта", filepath.Base(savedPath))
+		return
+	}
+
+	logError("Не удалось найти и скачать изображение после %d попыток.", cfgMaxAttempt)
+	fallbackLocal(false)
+}
