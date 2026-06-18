@@ -36,6 +36,12 @@
   .dir.down{bottom:14px; left:50%; margin-left:-31px}
   .dir.left{left:14px; top:50%; margin-top:-31px}
   .dir.right{right:14px; top:50%; margin-top:-31px}
+  .diag{position:absolute; width:46px; height:46px; border-radius:10px; background:var(--btn);
+        border:1px solid var(--edge); display:flex; align-items:center; justify-content:center; font-size:18px; padding:0; opacity:.92}
+  .diag.ul{top:30px; left:30px}
+  .diag.ur{top:30px; right:30px}
+  .diag.dl{bottom:30px; left:30px}
+  .diag.dr{bottom:30px; right:30px}
   .ent{position:absolute; top:50%; left:50%; margin:-48px 0 0 -48px;
        width:96px; height:96px; border-radius:50%; background:linear-gradient(180deg,#3a4150,#262b34);
        border:2px solid #4a5366; font-size:14px; font-weight:700; padding:0}
@@ -83,11 +89,15 @@
     <div>
       <div class="jog">
         <div class="ring"></div>
-        <button class="dir up"    data-id="" data-pl="00 08">▲</button>
-        <button class="dir down"  data-id="" data-pl="00 02">▼</button>
-        <button class="dir left"  data-id="" data-pl="00 01">◀</button>
-        <button class="dir right" data-id="" data-pl="00 04">▶</button>
-        <button class="ent"       data-id="" data-pl="40 00">PUSH<br>ENT</button>
+        <button class="dir up"    data-dir data-pl="00 08">▲</button>
+        <button class="dir down"  data-dir data-pl="00 02">▼</button>
+        <button class="dir left"  data-dir data-pl="00 01">◀</button>
+        <button class="dir right" data-dir data-pl="00 04">▶</button>
+        <button class="diag ul"   data-dir data-pl="00 09" title="UP+LEFT">↖</button>
+        <button class="diag ur"   data-dir data-pl="00 0C" title="UP+RIGHT">↗</button>
+        <button class="diag dl"   data-dir data-pl="00 03" title="DOWN+LEFT">↙</button>
+        <button class="diag dr"   data-dir data-pl="00 06" title="DOWN+RIGHT">↘</button>
+        <button class="ent"       data-pl="40 00">PUSH<br>ENT</button>
       </div>
       <div class="rot">
         <button data-id="ff" data-pl="">↺ CCW</button>
@@ -110,30 +120,28 @@
   <div class="side">
     <div class="card">
       <h2>Ручная отправка</h2>
-      <label class="f">FRAME — id + payload (hex)
-        <div class="inline"><input id="fId" value="80" style="max-width:64px"><input id="fPl" value="01" placeholder="01 00"><button id="fSend">послать</button></div>
+      <label class="f">KEY — маски lo + hi (hex)
+        <div class="inline"><input id="fLo" value="40" style="max-width:64px"><input id="fHi" value="00" style="max-width:64px"><button id="fSend">кнопка</button></div>
       </label>
-      <label class="f">RAW — сырые байты (без обёртки)
-        <div class="inline"><input id="rRaw" placeholder="01 80 02 01 01 00"><button id="rSend">послать</button></div>
+      <label class="f">RAW — сырые байты (hex)
+        <div class="inline"><input id="rRaw" placeholder="80 40 00 3F"><button id="rSend">послать</button></div>
       </label>
       <div class="row2">
-        <button id="scan">SCAN линию</button>
-        <button id="mon">MON слушать</button>
+        <button id="rel">REL (отпустить)</button>
+        <button id="help">HELP</button>
       </div>
-      <p class="hint">SCAN перебирает инверсию × порядок бит × скорость и ищет ответ ACK 0x06 — самый быстрый способ зафиксировать линию.</p>
+      <p class="hint">Кнопка = кадр <code>80 lo hi cks</code> (cks добивает сумму до 0xFF). Отпускание шлёт <code>80 00 00 7F</code>. Диагонали — OR битов hi (напр. UP+LEFT = hi 09).</p>
     </div>
 
     <div class="card">
       <h2>Параметры линии</h2>
       <div class="cfg">
         <label class="f">bit, мкс<input id="c_bit" value="208"></label>
-        <label class="f">gap, мкс<input id="c_gap" value="800"></label>
-        <label class="f">inverted<select id="c_inv"><option value="1">да</option><option value="0">нет</option></select></label>
+        <label class="f">gap, мкс<input id="c_gap" value="900"></label>
+        <label class="f">inverted<select id="c_inv"><option value="0" selected>нет (транзистор инвертирует)</option><option value="1">да</option></select></label>
         <label class="f">порядок бит<select id="c_msb"><option value="0">LSB</option><option value="1">MSB</option></select></label>
-        <label class="f">выход<select id="c_drive"><option value="pp">push-pull</option><option value="od">open-drain</option></select></label>
-        <label class="f">ACK timeout, мс<input id="c_acktmo" value="25"></label>
-        <label class="f">повторов<input id="c_retry" value="3"></label>
-        <label class="f">ID по умолч. (hex)<input id="c_id" value="80"></label>
+        <label class="f">выход<select id="c_drive"><option value="pp" selected>push-pull (на базу через 10к)</option><option value="od">open-drain</option></select></label>
+        <label class="f">release, мс<input id="c_rel" value="60"></label>
         <div class="span2"><button id="applyCfg" class="pill connect" style="width:100%">Применить</button></div>
       </div>
     </div>
@@ -141,9 +149,9 @@
 
   <div class="log" id="log"></div>
   <div class="hint">
-    Открой в <b>Chrome</b>/<b>Edge</b>, закрой Serial Monitor в Arduino IDE. «Подключить» → выбери COM-порт (115200).
-    Кнопку можно <b>держать</b> — кадр повторяется (как настоящий JOG ~каждые 120&nbsp;мс), отпустил — тишина. Энкодер ↺/↻ при удержании крутит.
-    Кнопки шлют <code>FRAME id payload</code>; id берётся из «ID по умолч.», payload — из подписи кнопки. Смотри ответ: <span class="ack">ACK</span> / <span class="nak">NAK</span> / тишина.
+    Открой в <b>Chrome</b>/<b>Edge</b>, закрой Serial Monitor. «Подключить» → COM-порт (115200).
+    Кнопку можно <b>держать</b> — кадр повторяется. <b>Отпускание</b> (<code>80 00 00 7F</code>) шлётся ТОЛЬКО для джойстика (стрелки + диагонали ↖↗↙↘), как у настоящего пульта; у остальных кнопок и энкодера отпускания нет.
+    Кнопки шлют <code>KEY lo hi</code> (RP2040 добивает cks до 0xFF) на 4800 бод. Выход — на базу BC847C через 10к (транзистор инвертирует и даёт «мягкий» ноль, как у штатного пульта).
   </div>
 
 <script>
@@ -179,36 +187,40 @@ async function send(cmd){
 }
 $('#connectBtn').addEventListener('click', connect);
 
-// FRAME-команда для кнопки: id из data-id (или глобальный), payload из data-pl
-function frameCmd(b){
-  const id = (b.dataset.id && b.dataset.id.trim()) ? b.dataset.id.trim() : $('#c_id').value.trim();
-  const pl = (b.dataset.pl||'').trim();
-  return ('FRAME '+id+(pl?(' '+pl):'')).trim();
+// команда кнопки: энкодер -> CW/CCW; обычная -> KEY lo hi (data-pl = "lo hi")
+function btnCmd(b){
+  const id=(b.dataset.id||'').trim().toLowerCase();
+  if(id==='81') return 'CW';
+  if(id==='ff') return 'CCW';
+  const pl=(b.dataset.pl||'00 00').trim();   // "lo hi"
+  return 'KEY '+pl;
 }
 
-// кнопки/энкодер: удержание = повтор кадра (как настоящий JOG)
+// кнопки/энкодер: удержание = повтор кадра; отпускание кнопки -> REL
 document.querySelectorAll('.panel button[data-pl], .panel button[data-id]').forEach(b=>{
   let t=null, pressed=false;
   const isRot = b.parentElement.classList.contains('rot');
-  const period = isRot ? 150 : 120;
+  const period = isRot ? 150 : 100;
   const down=e=>{ e.preventDefault(); if(pressed)return; pressed=true; b.classList.add('pressed');
-    const cmd=frameCmd(b); send(cmd);
+    const cmd=btnCmd(b); send(cmd);
     if($('#holdRep').checked) t=setInterval(()=>send(cmd), period);
   };
-  const up=()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); clearInterval(t); };
+  const up=()=>{ if(!pressed)return; pressed=false; b.classList.remove('pressed'); clearInterval(t);
+    if(b.hasAttribute('data-dir')) send('REL');   // отпускание ТОЛЬКО у джойстика (UP/DOWN/LEFT/RIGHT+диагонали)
+  };
   b.addEventListener('mousedown',down);
   b.addEventListener('touchstart',down,{passive:false});
   ['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>b.addEventListener(ev,up));
 });
 
 // ручная отправка / линия
-$('#fSend').addEventListener('click',()=>send('FRAME '+$('#fId').value.trim()+' '+$('#fPl').value.trim()));
+$('#fSend').addEventListener('click',()=>send('KEY '+$('#fLo').value.trim()+' '+$('#fHi').value.trim()));
 $('#rSend').addEventListener('click',()=>send('RAW '+$('#rRaw').value.trim()));
-$('#scan').addEventListener('click',()=>send('SCAN '+$('#fId').value.trim()+' '+($('#fPl').value.trim()||'01')));
-$('#mon').addEventListener('click',()=>send('MON 4000'));
+$('#rel').addEventListener('click',()=>send('REL'));
+$('#help').addEventListener('click',()=>send('HELP'));
 $('#applyCfg').addEventListener('click',()=>{
   const v=id=>$('#'+id).value;
-  send(`CFG bit=${v('c_bit')} gap=${v('c_gap')} inv=${v('c_inv')} msb=${v('c_msb')} drive=${v('c_drive')} acktmo=${v('c_acktmo')} retry=${v('c_retry')} id=${v('c_id')}`);
+  send(`CFG bit=${v('c_bit')} gap=${v('c_gap')} inv=${v('c_inv')} msb=${v('c_msb')} drive=${v('c_drive')} rel=${v('c_rel')}`);
 });
 if(!('serial' in navigator)) add('[Web Serial не поддерживается — открой в Chrome/Edge]\n','si');
 </script>
