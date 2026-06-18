@@ -274,11 +274,16 @@ def find_download_href_on_image_page(session: requests.Session, image_page_url: 
         log.warning("Превышен суточный лимит скачиваний на сайте.")
         raise DownloadLimitReachedError()
 
-    # Ищем ссылку на картинку
+    # Ищем ссылку на картинку — основной способ через js-download_img
     soup2 = BeautifulSoup(rr.text, "html.parser")
-    img = soup2.find("img", src=True)
-    if img and "img.goodfon" in img["src"]:
-        return urljoin(download_page_url, img["src"])
+    a_download = soup2.find("a", {"class": "js-download_img"})
+    if a_download and a_download.get("href") and "img.goodfon" in a_download["href"]:
+        return a_download["href"]
+
+    # Запасной вариант — img тег
+    img = soup2.find("img", src=lambda s: s and "img.goodfon" in s)
+    if img:
+        return img["src"]
 
     log.warning("Ссылка на картинку не найдена на странице загрузки: %s", download_page_url)
     return None
@@ -341,7 +346,12 @@ def set_wallpaper_from_like() -> bool:
     if not files:
         log.warning("Папка Like/%s пуста, загружаем с сайта", THEME)
         return False
-    chosen = random.choice(files)
+
+    # Исключаем текущую картинку чтобы не повторяться
+    current = get_current_wallpaper_path()
+    candidates = [f for f in files if f.lower() != (current or "").lower()]
+    chosen = random.choice(candidates if candidates else files)
+
     set_wallpaper(chosen)
     log.info("Обои из папки Like/%s: %s", THEME, chosen)
     notify("Обои обновлены ❤️", f"Из папки Like: {os.path.basename(chosen)}")
@@ -450,43 +460,80 @@ class DownloadLimitReachedError(Exception):
 
 def fallback_local(like_only: bool = False):
     """Устанавливает случайную картинку из локальной папки.
-    Если like_only=True — берёт только из папки Like."""
+    Если like_only=True — берёт только из папки Like/THEME."""
     if like_only:
         local_files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
     else:
-        local_files = [f for f in glob.glob(os.path.join(SAVE_DIR, "*.*")) if os.path.isfile(f)]
+        # При таймауте/ошибке сайта — сначала из Like/THEME, потом из основной папки
+        local_files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
         if not local_files:
-            local_files = [f for f in glob.glob(os.path.join(LIKE_DIR, "*.*")) if os.path.isfile(f)]
+            local_files = [f for f in glob.glob(os.path.join(SAVE_DIR, "*.*")) if os.path.isfile(f)]
 
-    if local_files:
-        chosen = random.choice(local_files)
-        log.info("Fallback: устанавливаем локальную картинку: %s", chosen)
-        set_wallpaper(chosen)
-        notify("Обои обновлены 📁", f"Локально: {os.path.basename(chosen)}")
-    else:
+    if not local_files:
         log.warning("Fallback: локальных картинок нет, обои не изменены.")
         notify("GoodFon: ошибка 😞", "Нет доступных картинок.")
+        return
+
+    # Получаем текущие обои чтобы не повторять одну и ту же картинку
+    current = get_current_wallpaper_path()
+    candidates = [f for f in local_files if f.lower() != (current or "").lower()]
+
+    # Если после фильтрации ничего не осталось (только 1 картинка) — берём что есть
+    chosen = random.choice(candidates if candidates else local_files)
+    log.info("Fallback: устанавливаем локальную картинку: %s", chosen)
+    set_wallpaper(chosen)
+    notify("Обои обновлены 📁", f"Локально: {os.path.basename(chosen)}")
 
 
 # ====== Основной запуск ======
 
+def is_site_available() -> bool:
+    """Быстрая проверка доступности сайта перед логином."""
+    try:
+        r = requests.get(SECTION_BASE_URL, timeout=8, headers={"User-Agent": USER_AGENT})
+        return r.status_code < 500
+    except Exception:
+        return False
+
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else "update"
+
+    # Проверяем доступность сайта до логина
+    if not is_site_available():
+        log.warning("Сайт недоступен, пропускаем авторизацию.")
+        # like/unlike без сайта не имеют смысла
+        if arg in ("like", "unlike"):
+            notify("GoodFon: сайт недоступен 😞", "Невозможно выполнить операцию с избранным.")
+            return
+        # При обычном update — меняем обои из избранного
+        write_counter(read_counter() + 1)
+        fallback_local()
+        return
 
     try:
         session = login_session()
     except Exception as e:
         log.error("Ошибка логина: %s", e)
+        fallback_local()
         return
 
     if arg == "like":
-        add_to_like(session)
+        try:
+            add_to_like(session)
+        except Exception as e:
+            log.error("Ошибка при добавлении в избранное: %s", e)
+            notify("GoodFon: ошибка 😞", "Не удалось добавить в избранное — сайт недоступен.")
         return
 
     if arg == "unlike":
-        if remove_from_like(session):
-            log.info("Загружаем новую картинку с сайта после удаления из избранного.")
-        else:
+        try:
+            if remove_from_like(session):
+                log.info("Загружаем новую картинку с сайта после удаления из избранного.")
+            else:
+                return
+        except Exception as e:
+            log.error("Ошибка при удалении из избранного: %s", e)
+            notify("GoodFon: ошибка 😞", "Не удалось удалить из избранного — сайт недоступен.")
             return
 
     # Счётчик: каждый LIKE_EVERY_N-й запуск берём картинку из Like
@@ -501,16 +548,17 @@ def main():
         log.info("Папка Like пуста, продолжаем загрузку с сайта")
 
     # Загрузка с сайта
-    try:
-        max_pages = get_max_pages(session)
-        log.info("Максимальное количество страниц: %d", max_pages)
-    except ValueError as e:
-        log.error("Ошибка пагинации: %s", e)
-        return
+    max_pages = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             log.info("Попытка %d из %d", attempt, MAX_ATTEMPTS)
+
+            # Пагинация внутри цикла — при сбое пробуем снова
+            if max_pages is None:
+                max_pages = get_max_pages(session)
+                log.info("Максимальное количество страниц: %d", max_pages)
+
             page_url = get_random_wallpaper_page_url(max_pages)
             log.info("Выбрана страница раздела: %s", page_url)
 
@@ -549,6 +597,11 @@ def main():
             notify("GoodFon: лимит исчерпан ⚠️", "Суточный лимит исчерпан. Загружаем из избранного.")
             fallback_local(like_only=True)
             return
+
+        except ValueError as e:
+            # Ошибка пагинации — сбрасываем и пробуем снова
+            log.warning("Ошибка пагинации при попытке %d: %s", attempt, e)
+            max_pages = None
 
         except Exception as e:
             log.error("Ошибка при попытке %d: %s", attempt, e)
