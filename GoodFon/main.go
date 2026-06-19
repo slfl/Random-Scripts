@@ -31,7 +31,9 @@ var (
 	cfgLikeEveryN int
 	cfgMaxAttempt int
 	cfgNotify     bool
+	cfgDomain     string
 
+	activeBase     string
 	likeDir        string
 	sectionBaseURL string
 	loginURL       string
@@ -42,7 +44,6 @@ const (
 	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 	quotaMarker   = "исчерпали возможное количество скачанных"
 	quotaMarker2  = "download_limit"
-	baseSiteCom   = "https://www.goodfon.com"
 	httpTimeout   = 15 * time.Second
 	probeTimeout  = 8 * time.Second
 )
@@ -121,15 +122,36 @@ func loadConfig() error {
 	cfgLikeEveryN = atoiOr(get("settings", "like_every_n"), 10)
 	cfgMaxAttempt = atoiOr(get("settings", "max_attempts"), 3)
 	cfgNotify = strings.EqualFold(strings.TrimSpace(get("settings", "notify")), "true")
+	cfgDomain = strings.ToLower(strings.TrimSpace(get("settings", "domain")))
 
 	if cfgSaveDir == "" || cfgTheme == "" {
 		return fmt.Errorf("в config.ini не заданы save_dir или theme")
 	}
 
 	likeDir = filepath.Join(cfgSaveDir, "Like", cfgTheme)
-	sectionBaseURL = fmt.Sprintf("%s/%s/", baseSiteCom, cfgTheme)
-	loginURL = baseSiteCom + "/auth/signin/"
+	initDomain("https://www.goodfon.com") // значение по умолчанию, переопределяется в main
 	return nil
+}
+
+// initDomain переключает все URL на указанный домен (com или ru).
+func initDomain(base string) {
+	activeBase = base
+	sectionBaseURL = fmt.Sprintf("%s/%s/", base, cfgTheme)
+	loginURL = base + "/auth/signin/"
+}
+
+// domainCandidates возвращает домены в порядке предпочтения (второй — запасной).
+func domainCandidates() []string {
+	com := "https://www.goodfon.com"
+	ru := "https://www.goodfon.ru"
+	switch cfgDomain {
+	case "ru":
+		return []string{ru, com}
+	case "com":
+		return []string{com, ru}
+	default:
+		return []string{com, ru}
+	}
 }
 
 func readCounter() int {
@@ -684,10 +706,10 @@ func addToLike(c *http.Client) {
 	_ = setWallpaper(dest)
 	logInfo("Обои переключены на копию из Like/%s", cfgTheme)
 
-	imagePageURL := fmt.Sprintf("%s/%s/wallpaper-%s.html", baseSiteCom, cfgTheme, nameOnly(name))
+	imagePageURL := fmt.Sprintf("%s/%s/wallpaper-%s.html", activeBase, cfgTheme, nameOnly(name))
 	addURL, _ := getFavoriteIDs(c, imagePageURL)
 	if addURL != "" {
-		_, status, _ := httpGet(c, resolveURL(baseSiteCom, addURL), imagePageURL)
+		_, status, _ := httpGet(c, resolveURL(activeBase, addURL), imagePageURL)
 		if status == 200 {
 			logInfo("Изображение добавлено в избранное на сайте: %s", name)
 			notify("Добавлено в избранное", name)
@@ -715,10 +737,10 @@ func removeFromLike(c *http.Client) bool {
 	name := filepath.Base(current)
 	logInfo("Удаляем из избранного: %s", name)
 
-	imagePageURL := fmt.Sprintf("%s/%s/wallpaper-%s.html", baseSiteCom, cfgTheme, nameOnly(name))
+	imagePageURL := fmt.Sprintf("%s/%s/wallpaper-%s.html", activeBase, cfgTheme, nameOnly(name))
 	_, delURL := getFavoriteIDs(c, imagePageURL)
 	if delURL != "" {
-		_, status, _ := httpGet(c, resolveURL(baseSiteCom, delURL), imagePageURL)
+		_, status, _ := httpGet(c, resolveURL(activeBase, delURL), imagePageURL)
 		if status == 200 {
 			logInfo("Изображение удалено из избранного на сайте: %s", name)
 		} else {
@@ -794,21 +816,31 @@ func main() {
 		return
 	}
 
-	// Проверка доступности сайта до логина
-	if !isSiteAvailable() {
-		logWarn("Сайт недоступен, пропускаем авторизацию.")
+	// Перебираем домены в порядке предпочтения: проверка доступности + логин.
+	var client *http.Client
+	for _, base := range domainCandidates() {
+		initDomain(base)
+		if !isSiteAvailable() {
+			logWarn("Домен недоступен: %s", base)
+			continue
+		}
+		c := newClient()
+		if err := login(c); err != nil {
+			logWarn("Не удалось войти на %s: %v", base, err)
+			continue
+		}
+		client = c
+		logInfo("Активный домен: %s", base)
+		break
+	}
+
+	if client == nil {
+		logError("Ни один домен недоступен или вход не выполнен.")
 		if arg == "like" || arg == "unlike" {
 			notify("GoodFon: сайт недоступен", "Операция с избранным невозможна.")
 			return
 		}
 		writeCounter(readCounter() + 1)
-		fallbackLocal(false)
-		return
-	}
-
-	client := newClient()
-	if err := login(client); err != nil {
-		logError("Ошибка логина: %v", err)
 		fallbackLocal(false)
 		return
 	}

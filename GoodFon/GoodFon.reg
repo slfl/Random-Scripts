@@ -3,7 +3,7 @@ Windows Registry Editor Version 5.00
 ; ====================================================================
 ;  Контекстное меню рабочего стола для GoodFon (вариант для .exe)
 ; --------------------------------------------------------------------
-;  ВАЖНО: замените путь C:\\Users\\USER\\Pictures\\GoodFon.exe
+;  ВАЖНО: замените путь C:\\Users\\Mansi\\Pictures\\GoodFon.exe
 ;         на реальный путь к вашему GoodFon.exe.
 ;  Обратные слэши в путях обязательно удваивать (\\).
 ;
@@ -16,18 +16,18 @@ Windows Registry Editor Version 5.00
 "Icon"="imageres.dll,-70"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\GoodFon\command]
-@="\"C:\\Users\\USER\\Pictures\\GoodFon.exe\" update"
+@="\"C:\\Users\\Mansi\\Pictures\\GoodFon.exe\" update"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\GoodFonLike]
 @="Добавить в избранное изображение рабочего стола"
 "Icon"="shell32.dll,43"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\GoodFonLike\command]
-@="\"C:\\Users\\USER\\Pictures\\GoodFon.exe\" like"
+@="\"C:\\Users\\Mansi\\Pictures\\GoodFon.exe\" like"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\GoodFonUnlike]
 @="Убрать из избранного изображение рабочего стола"
 "Icon"="shell32.dll,131"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\GoodFonUnlike\command]
-@="\"C:\\Users\\USER\\Pictures\\GoodFon.exe\" unlike"
+@="\"C:\\Users\\Mansi\\Pictures\\GoodFon.exe\" unlike"

@@ -61,12 +61,35 @@ MAX_FILES    = get_config_int("settings", "max_files", fallback=10)
 LIKE_EVERY_N = get_config_int("settings", "like_every_n", fallback=10)
 MAX_ATTEMPTS = get_config_int("settings", "max_attempts", fallback=3)
 NOTIFY       = config["settings"].getboolean("notify", fallback=True)
+DOMAIN_PREF  = config["settings"].get("domain", "auto").strip().lower()
 
-LIKE_DIR         = os.path.join(SAVE_DIR, "Like", THEME)
-SECTION_BASE_URL = f"https://www.goodfon.com/{THEME}/"
-LOGIN_URL        = "https://www.goodfon.com/auth/signin/"
-USER_AGENT       = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+LIKE_DIR  = os.path.join(SAVE_DIR, "Like", THEME)
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+
+# Активный домен задаётся в main() через init_domain(); здесь — значения по умолчанию.
+BASE             = "https://www.goodfon.com"
+SECTION_BASE_URL = f"{BASE}/{THEME}/"
+LOGIN_URL        = f"{BASE}/auth/signin/"
+
+
+def init_domain(base: str):
+    """Переключает все URL на указанный домен (com или ru)."""
+    global BASE, SECTION_BASE_URL, LOGIN_URL
+    BASE = base
+    SECTION_BASE_URL = f"{base}/{THEME}/"
+    LOGIN_URL = f"{base}/auth/signin/"
+
+
+def domain_candidates() -> List[str]:
+    """Список доменов в порядке предпочтения. Второй — запасной."""
+    com = "https://www.goodfon.com"
+    ru = "https://www.goodfon.ru"
+    if DOMAIN_PREF == "ru":
+        return [ru, com]
+    if DOMAIN_PREF == "com":
+        return [com, ru]
+    return [com, ru]  # auto
 
 DOWNLOAD_LIMIT_MARKER = "исчерпали возможное количество скачанных"
 # =====================
@@ -420,10 +443,10 @@ def add_to_like(session: requests.Session):
     set_wallpaper(dest_path)
     log.info("Обои переключены на копию из Like/%s", THEME)
 
-    image_page_url = f"https://www.goodfon.com/{THEME}/wallpaper-{name_only}.html"
+    image_page_url = f"{BASE}/{THEME}/wallpaper-{name_only}.html"
     add_url, _ = get_favorite_ids(session, image_page_url)
     if add_url:
-        rr = session.get(urljoin("https://www.goodfon.com", add_url),
+        rr = session.get(urljoin(BASE, add_url),
                          headers={"Referer": image_page_url}, timeout=15)
         if rr.status_code == 200:
             log.info("Изображение добавлено в избранное на сайте: %s", filename)
@@ -451,10 +474,10 @@ def remove_from_like(session: requests.Session) -> bool:
     name_only = os.path.splitext(filename)[0]
     log.info("Удаляем из избранного: %s", filename)
 
-    image_page_url = f"https://www.goodfon.com/{THEME}/wallpaper-{name_only}.html"
+    image_page_url = f"{BASE}/{THEME}/wallpaper-{name_only}.html"
     _, del_url = get_favorite_ids(session, image_page_url)
     if del_url:
-        rr = session.get(urljoin("https://www.goodfon.com", del_url),
+        rr = session.get(urljoin(BASE, del_url),
                          headers={"Referer": image_page_url}, timeout=15)
         if rr.status_code == 200:
             log.info("Изображение удалено из избранного на сайте: %s", filename)
@@ -502,20 +525,27 @@ def fallback_local(like_only: bool = False):
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else "update"
 
-    # Проверяем доступность сайта до логина
-    if not is_site_available():
-        log.warning("Сайт недоступен, пропускаем авторизацию.")
+    # Перебираем домены в порядке предпочтения: проверка доступности + логин.
+    session = None
+    for base in domain_candidates():
+        init_domain(base)
+        if not is_site_available():
+            log.warning("Домен недоступен: %s", base)
+            continue
+        try:
+            session = login_session()
+            log.info("Активный домен: %s", base)
+            break
+        except Exception as e:
+            log.warning("Не удалось войти на %s: %s", base, e)
+            session = None
+
+    if session is None:
+        log.error("Ни один домен недоступен или вход не выполнен.")
         if arg in ("like", "unlike"):
             notify("GoodFon: сайт недоступен", "Операция с избранным невозможна.")
             return
         write_counter(read_counter() + 1)
-        fallback_local()
-        return
-
-    try:
-        session = login_session()
-    except Exception as e:
-        log.error("Ошибка логина: %s", e)
         fallback_local()
         return
 
