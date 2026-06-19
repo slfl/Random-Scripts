@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 )
 
@@ -44,11 +47,12 @@ var (
 )
 
 const (
-	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-	quotaMarker   = "исчерпали возможное количество скачанных"
-	quotaMarker2  = "download_limit"
-	httpTimeout   = 15 * time.Second
-	probeTimeout  = 8 * time.Second
+	userAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+	quotaMarker  = "исчерпали возможное количество скачанных"
+	quotaMarker2 = "download_limit"
+	httpTimeout  = 30 * time.Second
+	pageTimeout  = 15 * time.Second
+	probeTimeout = 8 * time.Second
 )
 
 // errQuota — специальная ошибка превышения суточного лимита.
@@ -86,6 +90,8 @@ func loadConfig() error {
 	if err != nil {
 		return fmt.Errorf("файл конфигурации не найден: %s", configPath)
 	}
+	// Убираем BOM, если редактор его добавил.
+	data = []byte(strings.TrimPrefix(string(data), "\ufeff"))
 
 	sections := map[string]map[string]string{}
 	cur := ""
@@ -231,14 +237,16 @@ $xml.LoadXml($xmlString)
 $toast=[Windows.UI.Notifications.ToastNotification]::new($xml)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)`
 
-	// Пишем скрипт во временный .ps1 с UTF-8 BOM, чтобы кириллица читалась корректно.
-	tmp := filepath.Join(os.TempDir(), "goodfon_toast.ps1")
-	bom := []byte{0xEF, 0xBB, 0xBF}
-	if err := os.WriteFile(tmp, append(bom, []byte(script)...), 0644); err != nil {
-		logWarn("Не удалось записать toast-скрипт: %v", err)
-		return
+	// Кодируем скрипт в UTF-16LE base64 и передаём через -EncodedCommand:
+	// без временных файлов, без BOM, корректная кириллица.
+	u16 := utf16.Encode([]rune(script))
+	raw := make([]byte, len(u16)*2)
+	for i, c := range u16 {
+		raw[i*2] = byte(c)
+		raw[i*2+1] = byte(c >> 8)
 	}
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp)
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Run(); err != nil {
 		logWarn("Не удалось показать уведомление: %v", err)
@@ -251,8 +259,8 @@ var (
 	user32              = syscall.NewLazyDLL("user32.dll")
 	procSystemParamInfo = user32.NewProc("SystemParametersInfoW")
 
-	kernel32             = syscall.NewLazyDLL("kernel32.dll")
-	procAttachConsole    = kernel32.NewProc("AttachConsole")
+	kernel32          = syscall.NewLazyDLL("kernel32.dll")
+	procAttachConsole = kernel32.NewProc("AttachConsole")
 )
 
 const attachParentProcess = ^uintptr(0) // (DWORD)-1
@@ -344,12 +352,25 @@ func newClient() *http.Client {
 	return &http.Client{Jar: jar, Timeout: httpTimeout}
 }
 
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+}
+
 func httpGet(c *http.Client, u, referer string) (string, int, error) {
-	req, err := http.NewRequest("GET", u, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), pageTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return "", 0, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	setBrowserHeaders(req)
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
@@ -366,11 +387,13 @@ func httpGet(c *http.Client, u, referer string) (string, int, error) {
 }
 
 func httpGetBytes(c *http.Client, u, referer string) ([]byte, string, int, error) {
-	req, err := http.NewRequest("GET", u, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), pageTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, "", 0, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	setBrowserHeaders(req)
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
@@ -386,7 +409,7 @@ func httpGetBytes(c *http.Client, u, referer string) ([]byte, string, int, error
 // ====== Авторизация ======
 
 var reCSRF = regexp.MustCompile(`(?s)<input[^>]*csrfmiddlewaretoken[^>]*>`)
-var reValue = regexp.MustCompile(`value="([^"]*)"`)
+var reValue = regexp.MustCompile(`value=["']?([^"'\s>]+)`)
 
 func login(c *http.Client) error {
 	html, _, err := httpGet(c, loginURL, "")
@@ -406,9 +429,11 @@ func login(c *http.Client) error {
 	form.Set("password", cfgPassword)
 
 	req, _ := http.NewRequest("POST", loginURL, strings.NewReader(form.Encode()))
-	req.Header.Set("User-Agent", userAgent)
+	setBrowserHeaders(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Referer", loginURL)
+	req.Header.Set("Origin", activeBase)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	if token != "" {
 		req.Header.Set("X-CSRFToken", token)
 	}
@@ -418,7 +443,23 @@ func login(c *http.Client) error {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 || strings.Contains(string(body), "Incorrect password") {
+	text := strings.ToLower(string(body))
+	hasSession := false
+	if u, e := url.Parse(loginURL); e == nil {
+		for _, ck := range c.Jar.Cookies(u) {
+			if ck.Name == "sessionid" && ck.Value != "" {
+				hasSession = true
+			}
+		}
+	}
+	jsonOK := strings.Contains(text, `"success"`) ||
+		strings.Contains(text, `result": "ok`) ||
+		strings.Contains(text, `result":"ok`)
+	failMark := strings.Contains(text, "incorrect password") ||
+		strings.Contains(text, `"error"`) ||
+		strings.Contains(text, `"fail"`) ||
+		strings.Contains(text, "не угадали")
+	if resp.StatusCode >= 400 || failMark || !(jsonOK || hasSession) {
 		return errBadCreds
 	}
 	logInfo("Авторизация успешна")
@@ -523,14 +564,6 @@ func buildSessionFromCache(cookieStr, base string) *http.Client {
 	return &http.Client{Jar: jar, Timeout: httpTimeout}
 }
 
-func isLoggedIn(c *http.Client) bool {
-	html, status, err := httpGet(c, sectionBaseURL, "")
-	if err != nil || status != 200 {
-		return false
-	}
-	return strings.Contains(strings.ToLower(html), "auth/logout")
-}
-
 // ====== Пагинация и сбор ссылок ======
 
 var reIndexPage = regexp.MustCompile(`index-(\d+)\.html`)
@@ -563,7 +596,7 @@ func randomPageURL(maxPages int) string {
 	return fmt.Sprintf("%sindex-%d.html", sectionBaseURL, n)
 }
 
-var reWallpaperLink = regexp.MustCompile(`href="(/[^"]*?/wallpaper-[^"]*?\.html)"`)
+var reWallpaperLink = regexp.MustCompile(`href=["']?([^"'\s>]*?/wallpaper-[^"'\s>]*?\.html)`)
 
 func collectWallpaperLinks(html string) []string {
 	seen := map[string]bool{}
@@ -594,7 +627,7 @@ func findDownloadURL(c *http.Client, imagePageURL string) (string, error) {
 	}
 
 	// Строго ищем ссылку с нужным разрешением (с дефисом в конце).
-	pat := regexp.MustCompile(`href="([^"]*wallpaper-download-` + regexp.QuoteMeta(cfgResolution) + `-[^"]*\.html)"`)
+	pat := regexp.MustCompile(`href=["']?([^"'\s>]*wallpaper-download-` + regexp.QuoteMeta(cfgResolution) + `-[^"'\s>]*\.html)`)
 	m := pat.FindStringSubmatch(html)
 	if m == nil {
 		logInfo("Разрешение %s недоступно для этой картинки, пропускаем.", cfgResolution)
@@ -618,14 +651,14 @@ func findDownloadURL(c *http.Client, imagePageURL string) (string, error) {
 	// Ссылка на оригинал в <a class="js-download_img" href="...">
 	reDl := regexp.MustCompile(`(<a[^>]*js-download_img[^>]*>)`)
 	if tag := reDl.FindString(dhtml); tag != "" {
-		if hm := regexp.MustCompile(`href="([^"]+)"`).FindStringSubmatch(tag); hm != nil {
+		if hm := regexp.MustCompile(`href=["']?([^"'\s>]+)`).FindStringSubmatch(tag); hm != nil {
 			if strings.Contains(hm[1], "img.goodfon") {
 				return hm[1], nil
 			}
 		}
 	}
 	// Запасной вариант — img с img.goodfon
-	if im := regexp.MustCompile(`<img[^>]*src="([^"]*img\.goodfon[^"]*)"`).FindStringSubmatch(dhtml); im != nil {
+	if im := regexp.MustCompile(`<img[^>]*src=["']?([^"'\s>]*img\.goodfon[^"'\s>]*)`).FindStringSubmatch(dhtml); im != nil {
 		return im[1], nil
 	}
 
@@ -755,8 +788,8 @@ func resolveURL(base, ref string) string {
 	return b.ResolveReference(r).String()
 }
 
-var reAddURL = regexp.MustCompile(`data-add="([^"]+)"`)
-var reDelURL = regexp.MustCompile(`data-del="([^"]+)"`)
+var reAddURL = regexp.MustCompile(`data-add=["']?([^"'\s>]+)`)
+var reDelURL = regexp.MustCompile(`data-del=["']?([^"'\s>]+)`)
 
 func getFavoriteIDs(c *http.Client, imagePageURL string) (addURL, delURL string) {
 	html, status, err := httpGet(c, imagePageURL, "")
@@ -918,19 +951,16 @@ func main() {
 		return
 	}
 
-	// Для каждого домена (в порядке предпочтения): сначала его кэш, затем вход.
+	// Для каждого домена: если есть кэш cookie — используем напрямую,
+	// не обращаясь к эндпоинту логина (сайт может его подвешивать).
 	var client *http.Client
 	for _, base := range domainCandidates() {
 		initDomain(base)
 
 		if cookieStr := cacheForBase(base); cookieStr != "" {
-			cached := buildSessionFromCache(cookieStr, base)
-			if isLoggedIn(cached) {
-				client = cached
-				logInfo("Используется кэш сессии: %s", base)
-				break
-			}
-			logInfo("Кэш для %s недействителен, выполняем вход.", base)
+			client = buildSessionFromCache(cookieStr, base)
+			logInfo("Используется кэш сессии: %s", base)
+			break
 		}
 
 		if !isSiteAvailable() {

@@ -38,7 +38,8 @@ config = configparser.ConfigParser(interpolation=None)
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(f"Файл конфигурации не найден: {CONFIG_FILE}")
-    config.read(CONFIG_FILE, encoding="utf-8")
+    # utf-8-sig корректно читает файл и с BOM, и без него.
+    config.read(CONFIG_FILE, encoding="utf-8-sig")
 
 
 def get_config_str(section: str, key: str) -> str:
@@ -68,6 +69,19 @@ SESSION_RU   = config["auth"].get("session_ru", "").strip()
 LIKE_DIR  = os.path.join(SAVE_DIR, "Like", THEME)
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+
+# Браузероподобные заголовки — снижают риск блокировки автоматических запросов.
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 # Активный домен задаётся в main() через init_domain(); здесь — значения по умолчанию.
 BASE             = "https://www.goodfon.com"
@@ -113,7 +127,7 @@ class DownloadLimitReachedError(Exception):
 # ====== Счётчик в config.ini ======
 
 def read_counter() -> int:
-    config.read(CONFIG_FILE, encoding="utf-8")
+    config.read(CONFIG_FILE, encoding="utf-8-sig")
     return config["state"].getint("counter", fallback=0)
 
 
@@ -217,15 +231,24 @@ def get_csrf_token_from_page(html: str) -> str:
 
 def login_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
+    s.headers.update(BROWSER_HEADERS)
     r = s.get(LOGIN_URL, timeout=15)
     token = get_csrf_token_from_page(r.text)
     payload = {"csrfmiddlewaretoken": token, "login": LOGIN, "password": PASSWORD}
     headers = {"Referer": LOGIN_URL}
     if token:
         headers["X-CSRFToken"] = token
-    resp = s.post(LOGIN_URL, data=payload, headers=headers, allow_redirects=True, timeout=15)
-    if resp.status_code >= 400 or "Incorrect password" in resp.text:
+    resp = s.post(LOGIN_URL, data=payload, headers=headers, allow_redirects=True, timeout=30)
+    text = resp.text.lower()
+    has_session = any(c.name == "sessionid" and c.value for c in s.cookies)
+    json_ok = ('"success"' in text) or ('result": "ok' in text) or ('result":"ok' in text)
+    fail_mark = (
+        "incorrect password" in text
+        or '"error"' in text
+        or '"fail"' in text
+        or "не угадали" in text
+    )
+    if resp.status_code >= 400 or fail_mark or not (json_ok or has_session):
         raise RuntimeError("Неверный логин или пароль.")
     log.info("Авторизация успешна")
     return s
@@ -267,7 +290,7 @@ def cache_for(base: str) -> str:
 def save_session_cache(session: requests.Session, base: str):
     """Сохраняет cookie сессии в поле своего домена, не трогая другой кэш."""
     cookies = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
-    config.read(CONFIG_FILE, encoding="utf-8")
+    config.read(CONFIG_FILE, encoding="utf-8-sig")
     if not config.has_section("auth"):
         config.add_section("auth")
     config["auth"][_cache_key_for(base)] = cookies
@@ -279,7 +302,7 @@ def save_session_cache(session: requests.Session, base: str):
 def build_session_from_cache(cookie_str: str, base: str) -> requests.Session:
     """Поднимает сессию из сохранённых cookie указанного домена."""
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
+    s.headers.update(BROWSER_HEADERS)
     host = urlparse(base).hostname
     for part in cookie_str.split(";"):
         part = part.strip()
@@ -291,12 +314,15 @@ def build_session_from_cache(cookie_str: str, base: str) -> requests.Session:
 
 
 def is_logged_in(session: requests.Session) -> bool:
-    """Проверяет, что сессия авторизована (по наличию ссылки выхода)."""
+    """Проверяет, что сессия авторизована: на странице входа уже нет формы с паролем."""
     try:
-        r = session.get(SECTION_BASE_URL, timeout=15)
+        r = session.get(LOGIN_URL, timeout=15)
     except Exception:
         return False
-    return r.status_code == 200 and "auth/logout" in r.text
+    if r.status_code != 200:
+        return False
+    t = r.text.lower()
+    return ('name="password"' not in t) and ("name=password" not in t)
 
 
 # ====== Пагинация и сбор ссылок ======
@@ -588,18 +614,17 @@ def main():
 
     session = None
 
-    # Для каждого домена (в порядке предпочтения): сначала его кэш, затем вход.
+    # Для каждого домена: если есть кэш cookie — используем его напрямую
+    # (без обращения к эндпоинту логина, который сайт может подвешивать).
+    # Если кэша нет — пробуем обычный вход.
     for base in domain_candidates():
         init_domain(base)
 
         cached_cookies = cache_for(base)
         if cached_cookies:
-            cached = build_session_from_cache(cached_cookies, base)
-            if is_logged_in(cached):
-                session = cached
-                log.info("Используется кэш сессии: %s", base)
-                break
-            log.info("Кэш для %s недействителен, выполняем вход.", base)
+            session = build_session_from_cache(cached_cookies, base)
+            log.info("Используется кэш сессии: %s", base)
+            break
 
         if not is_site_available():
             log.warning("Домен недоступен: %s", base)
