@@ -32,7 +32,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
 
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(interpolation=None)
 
 
 def load_config():
@@ -62,6 +62,8 @@ LIKE_EVERY_N = get_config_int("settings", "like_every_n", fallback=10)
 MAX_ATTEMPTS = get_config_int("settings", "max_attempts", fallback=3)
 NOTIFY       = config["settings"].getboolean("notify", fallback=True)
 DOMAIN_PREF  = config["settings"].get("domain", "auto").strip().lower()
+SESSION_COM  = config["auth"].get("session_com", "").strip()
+SESSION_RU   = config["auth"].get("session_ru", "").strip()
 
 LIKE_DIR  = os.path.join(SAVE_DIR, "Like", THEME)
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -236,6 +238,51 @@ def is_site_available() -> bool:
         return r.status_code < 500
     except Exception:
         return False
+
+
+# ====== Кэш сессии (cookie) — отдельный для каждого домена ======
+
+def _cache_key_for(base: str) -> str:
+    return "session_ru" if "goodfon.ru" in base else "session_com"
+
+
+def cache_for(base: str) -> str:
+    return SESSION_RU if "goodfon.ru" in base else SESSION_COM
+
+
+def save_session_cache(session: requests.Session, base: str):
+    """Сохраняет cookie сессии в поле своего домена, не трогая другой кэш."""
+    cookies = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+    config.read(CONFIG_FILE, encoding="utf-8")
+    if not config.has_section("auth"):
+        config.add_section("auth")
+    config["auth"][_cache_key_for(base)] = cookies
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        config.write(f)
+    log.info("Кэш сессии сохранён для домена %s", base)
+
+
+def build_session_from_cache(cookie_str: str, base: str) -> requests.Session:
+    """Поднимает сессию из сохранённых cookie указанного домена."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    host = urlparse(base).hostname
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        s.cookies.set(name.strip(), value.strip(), domain=host)
+    return s
+
+
+def is_logged_in(session: requests.Session) -> bool:
+    """Проверяет, что сессия авторизована (по наличию ссылки выхода)."""
+    try:
+        r = session.get(SECTION_BASE_URL, timeout=15)
+    except Exception:
+        return False
+    return r.status_code == 200 and "auth/logout" in r.text
 
 
 # ====== Пагинация и сбор ссылок ======
@@ -525,16 +572,28 @@ def fallback_local(like_only: bool = False):
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else "update"
 
-    # Перебираем домены в порядке предпочтения: проверка доступности + логин.
     session = None
+
+    # Для каждого домена (в порядке предпочтения): сначала его кэш, затем вход.
     for base in domain_candidates():
         init_domain(base)
+
+        cached_cookies = cache_for(base)
+        if cached_cookies:
+            cached = build_session_from_cache(cached_cookies, base)
+            if is_logged_in(cached):
+                session = cached
+                log.info("Используется кэш сессии: %s", base)
+                break
+            log.info("Кэш для %s недействителен, выполняем вход.", base)
+
         if not is_site_available():
             log.warning("Домен недоступен: %s", base)
             continue
         try:
             session = login_session()
             log.info("Активный домен: %s", base)
+            save_session_cache(session, base)
             break
         except Exception as e:
             log.warning("Не удалось войти на %s: %s", base, e)

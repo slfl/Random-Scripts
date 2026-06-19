@@ -32,6 +32,8 @@ var (
 	cfgMaxAttempt int
 	cfgNotify     bool
 	cfgDomain     string
+	cfgSessCom    string
+	cfgSessRu     string
 
 	activeBase     string
 	likeDir        string
@@ -123,6 +125,8 @@ func loadConfig() error {
 	cfgMaxAttempt = atoiOr(get("settings", "max_attempts"), 3)
 	cfgNotify = strings.EqualFold(strings.TrimSpace(get("settings", "notify")), "true")
 	cfgDomain = strings.ToLower(strings.TrimSpace(get("settings", "domain")))
+	cfgSessCom = strings.TrimSpace(get("auth", "session_com"))
+	cfgSessRu = strings.TrimSpace(get("auth", "session_ru"))
 
 	if cfgSaveDir == "" || cfgTheme == "" {
 		return fmt.Errorf("в config.ini не заданы save_dir или theme")
@@ -427,6 +431,86 @@ func isSiteAvailable() bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode < 500
+}
+
+// ====== Кэш сессии (cookie) ======
+
+// upsertConfigKey заменяет значение ключа (или вставляет его в нужную секцию),
+// сохраняя остальное содержимое файла.
+func upsertConfigKey(text, section, key, value string) string {
+	re := regexp.MustCompile(`(?mi)^([ \t]*` + regexp.QuoteMeta(key) + `[ \t]*=).*$`)
+	if re.MatchString(text) {
+		return re.ReplaceAllString(text, "$1 "+value)
+	}
+	secRe := regexp.MustCompile(`(?mi)^\[` + regexp.QuoteMeta(section) + `\][^\n]*\n`)
+	loc := secRe.FindStringIndex(text)
+	if loc == nil {
+		return strings.TrimRight(text, "\n") + "\n\n[" + section + "]\n" + key + " = " + value + "\n"
+	}
+	return text[:loc[1]] + key + " = " + value + "\n" + text[loc[1]:]
+}
+
+func cacheKeyForBase(base string) string {
+	if strings.Contains(base, "goodfon.ru") {
+		return "session_ru"
+	}
+	return "session_com"
+}
+
+func cacheForBase(base string) string {
+	if strings.Contains(base, "goodfon.ru") {
+		return cfgSessRu
+	}
+	return cfgSessCom
+}
+
+func saveSessionCache(c *http.Client, base string) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return
+	}
+	var parts []string
+	for _, ck := range c.Jar.Cookies(u) {
+		parts = append(parts, ck.Name+"="+ck.Value)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	text := upsertConfigKey(string(data), "auth", cacheKeyForBase(base), strings.Join(parts, "; "))
+	if err := os.WriteFile(configPath, []byte(text), 0644); err == nil {
+		logInfo("Кэш сессии сохранён для домена %s", base)
+	}
+}
+
+func buildSessionFromCache(cookieStr, base string) *http.Client {
+	jar, _ := cookiejar.New(nil)
+	u, _ := url.Parse(base)
+	var cks []*http.Cookie
+	for _, part := range strings.Split(cookieStr, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i := strings.Index(part, "=")
+		if i < 0 {
+			continue
+		}
+		cks = append(cks, &http.Cookie{
+			Name:  strings.TrimSpace(part[:i]),
+			Value: strings.TrimSpace(part[i+1:]),
+		})
+	}
+	jar.SetCookies(u, cks)
+	return &http.Client{Jar: jar, Timeout: httpTimeout}
+}
+
+func isLoggedIn(c *http.Client) bool {
+	html, status, err := httpGet(c, sectionBaseURL, "")
+	if err != nil || status != 200 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(html), "auth/logout")
 }
 
 // ====== Пагинация и сбор ссылок ======
@@ -816,10 +900,21 @@ func main() {
 		return
 	}
 
-	// Перебираем домены в порядке предпочтения: проверка доступности + логин.
+	// Для каждого домена (в порядке предпочтения): сначала его кэш, затем вход.
 	var client *http.Client
 	for _, base := range domainCandidates() {
 		initDomain(base)
+
+		if cookieStr := cacheForBase(base); cookieStr != "" {
+			cached := buildSessionFromCache(cookieStr, base)
+			if isLoggedIn(cached) {
+				client = cached
+				logInfo("Используется кэш сессии: %s", base)
+				break
+			}
+			logInfo("Кэш для %s недействителен, выполняем вход.", base)
+		}
+
 		if !isSiteAvailable() {
 			logWarn("Домен недоступен: %s", base)
 			continue
@@ -831,6 +926,7 @@ func main() {
 		}
 		client = c
 		logInfo("Активный домен: %s", base)
+		saveSessionCache(c, base)
 		break
 	}
 
