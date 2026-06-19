@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -52,6 +53,9 @@ const (
 
 // errQuota — специальная ошибка превышения суточного лимита.
 var errQuota = fmt.Errorf("download limit reached")
+
+// errBadCreds — отказ авторизации из-за неверных логина/пароля (повторять бессмысленно).
+var errBadCreds = errors.New("неверный логин или пароль")
 
 // ====== Логирование ======
 
@@ -415,10 +419,24 @@ func login(c *http.Client) error {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 || strings.Contains(string(body), "Incorrect password") {
-		return fmt.Errorf("неверный логин или пароль")
+		return errBadCreds
 	}
 	logInfo("Авторизация успешна")
 	return nil
+}
+
+// loginWithRetry повторяет вход при сетевых ошибках/таймаутах,
+// но не повторяет при неверных логине/пароле.
+func loginWithRetry(c *http.Client) error {
+	var err error
+	for try := 1; try <= 2; try++ {
+		err = login(c)
+		if err == nil || errors.Is(err, errBadCreds) {
+			return err
+		}
+		logWarn("Сетевая ошибка входа (попытка %d): %v", try, err)
+	}
+	return err
 }
 
 func isSiteAvailable() bool {
@@ -920,7 +938,7 @@ func main() {
 			continue
 		}
 		c := newClient()
-		if err := login(c); err != nil {
+		if err := loginWithRetry(c); err != nil {
 			logWarn("Не удалось войти на %s: %v", base, err)
 			continue
 		}

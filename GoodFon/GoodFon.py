@@ -231,6 +231,20 @@ def login_session() -> requests.Session:
     return s
 
 
+def login_session_retry() -> requests.Session:
+    """Повторяет вход при сетевых ошибках/таймаутах; при неверном пароле — сразу падает."""
+    last = None
+    for attempt in range(1, 3):
+        try:
+            return login_session()
+        except RuntimeError:
+            raise  # неверные логин/пароль — повторять бессмысленно
+        except Exception as e:
+            last = e
+            log.warning("Сетевая ошибка входа (попытка %d): %s", attempt, e)
+    raise last
+
+
 def is_site_available() -> bool:
     """Быстрая проверка доступности сайта перед логином."""
     try:
@@ -591,7 +605,7 @@ def main():
             log.warning("Домен недоступен: %s", base)
             continue
         try:
-            session = login_session()
+            session = login_session_retry()
             log.info("Активный домен: %s", base)
             save_session_cache(session, base)
             break
