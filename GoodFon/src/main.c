@@ -1560,6 +1560,170 @@ static void do_unlike(void)
     do_update(); /* сразу ставим новую */
 }
 
+/* ================= Синхронизация избранного с сайтом ================= */
+
+/* Простое множество slug'ов (динамический массив с дедупликацией). */
+typedef struct { char (*a)[160]; int n, cap; } SlugSet;
+static void set_init(SlugSet *s) { s->a = NULL; s->n = 0; s->cap = 0; }
+static void set_free(SlugSet *s) { free(s->a); s->a = NULL; s->n = 0; s->cap = 0; }
+static int  set_has(SlugSet *s, const char *x)
+{ for (int i = 0; i < s->n; i++) if (!strcmp(s->a[i], x)) return 1; return 0; }
+static void set_add(SlugSet *s, const char *x)
+{
+    if (!x[0] || set_has(s, x)) return;
+    if (s->n >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 64;
+        void *na = realloc(s->a, (size_t)nc * 160);
+        if (!na) return;
+        s->a = (char (*)[160])na; s->cap = nc;
+    }
+    strncpy(s->a[s->n], x, 159); s->a[s->n][159] = 0; s->n++;
+}
+
+/* Вытащить slug'и карточек (/wallpaper-<slug>.html) из HTML в множество. */
+static void extract_fav_slugs(const char *html, SlugSet *out)
+{
+    const char *p = html;
+    while ((p = strstr(p, "/wallpaper-")) != NULL) {
+        const char *d = p + 11;               /* после "/wallpaper-" */
+        if (!strncmp(d, "download-", 9)) { p = d; continue; }
+        const char *e = strstr(d, ".html");
+        if (e && e > d && (size_t)(e - d) < 159) {
+            char slug[160];
+            size_t len = (size_t)(e - d);
+            memcpy(slug, d, len); slug[len] = 0;
+            CharLowerA(slug);
+            set_add(out, slug);
+            p = e + 5;
+        } else {
+            p = d;
+        }
+    }
+}
+
+/* Односторонняя синхронизация: локально остаётся только то, что есть в
+ * избранном на сайте; лишнее удаляется. Ничего не качает.
+ * ЛЮБОЕ сомнение (сеть, неполная страница, пусто) -> отмена без удаления. */
+static void sync_favorites(void)
+{
+    char login[128];
+    strncpy(login, g_cfg.login, sizeof(login) - 1); login[sizeof(login) - 1] = 0;
+    if (!login[0]) { LOG_INFO("Синк избранного пропущен: не задан логин."); return; }
+    if (!ensure_session()) { LOG_INFO("Синк избранного отменён: нет входа."); return; }
+
+    char base[64]; base_url(base, sizeof(base));
+    char url[512];
+
+    /* страница 1 -> определить число страниц по ссылкам &page=N */
+    snprintf(url, sizeof(url), "%s/user/%s/favorite/", base, login);
+    HttpResp r;
+    if (!http_request("GET", url, NULL, NULL, 15000, BODY_LIMIT, &r) ||
+        r.status != 200 || !r.body) {
+        LOG_WARN("Синк избранного отменён: страница избранного недоступна (статус %d).", r.status);
+        free(r.body); return;
+    }
+    int M = 1;
+    { const char *p = r.body;
+      while ((p = strstr(p, "&page=")) != NULL) { int v = atoi(p + 6); if (v > M) M = v; p += 6; } }
+    free(r.body);
+    if (M > 1000) M = 1000;   /* защита от абсурда */
+    LOG_INFO("Синк избранного: страниц на сайте %d", M);
+
+    const int FULL_PAGE = 24, MAX_TRY = 10, CONVERGE = 3;
+    SlugSet site; set_init(&site);
+
+    for (int pg = 1; pg <= M; pg++) {
+        SlugSet page; set_init(&page);
+        int clean_seen = 0, stable = 0, ok200 = 0;
+
+        for (int t = 0; t < MAX_TRY; t++) {
+            if (pg == 1) snprintf(url, sizeof(url), "%s/user/%s/favorite/", base, login);
+            else         snprintf(url, sizeof(url), "%s/user/%s/favorite/?&page=%d", base, login, pg);
+
+            HttpResp rr;
+            if (!http_request("GET", url, NULL, NULL, 15000, BODY_LIMIT, &rr) ||
+                rr.status != 200 || !rr.body) { free(rr.body); Sleep(400); continue; }
+            ok200 = 1;
+            int dirty  = (strstr(rr.body, "Bad Gateway") != NULL);
+            int before = page.n;
+            extract_fav_slugs(rr.body, &page);
+            free(rr.body);
+
+            if (!dirty) clean_seen = 1;
+            if (page.n == before) stable++; else stable = 0;
+
+            if (pg <  M && page.n >= FULL_PAGE) break;               /* полная страница собрана */
+            if (pg == M && (clean_seen || (stable >= CONVERGE && page.n > 0))) break;
+            Sleep(400);
+        }
+
+        /* Проверка полноты. Не уверены -> отмена всего синка. */
+        int complete;
+        if (!ok200) complete = 0;
+        else if (pg < M) complete = (page.n >= FULL_PAGE) || clean_seen;
+        else complete = clean_seen || (stable >= CONVERGE && page.n > 0);
+
+        if (!complete) {
+            LOG_WARN("Синк избранного ОТМЕНЁН: страница %d прочитана неполно (собрано %d) — ничего не удаляем.",
+                     pg, page.n);
+            set_free(&page); set_free(&site); return;
+        }
+        for (int i = 0; i < page.n; i++) set_add(&site, page.a[i]);
+        LOG_INFO("Синк: страница %d прочитана (на ней %d, всего в базе %d)", pg, page.n, site.n);
+        set_free(&page);
+    }
+
+    if (site.n == 0) {
+        LOG_WARN("Синк избранного отменён: список с сайта пуст.");
+        set_free(&site); return;
+    }
+
+    /* Удаление локальных картинок, которых нет в избранном на сайте.
+     * Чистим корень Like и все подпапки Like\<тема> (сайт плоский). */
+    WCHAR wsave[MAX_PATH], like_base[MAX_PATH];
+    utf8_to_wide(g_cfg.save_dir, wsave, MAX_PATH);
+    wcscpy(like_base, wsave); PathAppendW(like_base, L"Like");
+
+    int deleted = 0, kept = 0;
+
+    /* список директорий для чистки: сам Like + его подпапки */
+    WCHAR dirs[128][MAX_PATH]; int nd = 0;
+    wcscpy(dirs[nd++], like_base);
+    WCHAR pat[MAX_PATH]; _snwprintf(pat, MAX_PATH, L"%s\\*", like_base);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            if (nd < 128) _snwprintf(dirs[nd++], MAX_PATH, L"%s\\%s", like_base, fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    for (int di = 0; di < nd; di++) {
+        int n = 0;
+        FileEnt *files = dir_scan(dirs[di], &n);
+        if (!files) continue;
+        for (int i = 0; i < n; i++) {
+            WCHAR wbase[MAX_PATH];
+            wcscpy(wbase, PathFindFileNameW(files[i].path));
+            WCHAR *dot = wcsrchr(wbase, L'.'); if (dot) *dot = 0;
+            char slug8[160]; wide_to_utf8(wbase, slug8, sizeof(slug8)); CharLowerA(slug8);
+            if (set_has(&site, slug8)) { kept++; continue; }
+            if (DeleteFileW(files[i].path)) {
+                deleted++;
+                char f8[MAX_PATH * 3]; wide_to_utf8(files[i].path, f8, sizeof(f8));
+                LOG_INFO("Удалено (нет в избранном на сайте): %s", f8);
+            }
+        }
+        free(files);
+    }
+
+    LOG_INFO("Синк избранного завершён: на сайте %d, оставлено %d, удалено %d.",
+             site.n, kept, deleted);
+    set_free(&site);
+}
+
 /* ================= Автозапуск (реестр) ================= */
 
 static int autostart_enabled(void)
@@ -1622,6 +1786,20 @@ static void run_async(int action)
     HANDLE h = CreateThread(NULL, 0, worker_thread, (LPVOID)(INT_PTR)action, 0, NULL);
     if (h) CloseHandle(h);
     else InterlockedExchange(&g_busy, 0);
+}
+
+/* Стартовый поток: сначала синхронизация избранного, затем первая смена обоев. */
+static DWORD WINAPI startup_thread(LPVOID param)
+{
+    (void)param;
+    LARGE_INTEGER li; QueryPerformanceCounter(&li);
+    srand((unsigned)(li.LowPart ^ li.HighPart ^ GetCurrentThreadId()));
+
+    if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) return 0;
+    sync_favorites();     /* безопасно: при любом сомнении ничего не удаляет */
+    do_update();          /* первая смена обоев */
+    InterlockedExchange(&g_busy, 0);
+    return 0;
 }
 
 /* ================= Диалог ввода логина/пароля ================= */
@@ -1950,7 +2128,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
                            NULL, NULL, hInst, NULL);
     tray_add();
     apply_interval();
-    run_async(IDM_UPDATE);   /* первая смена сразу при старте */
+    /* синхронизация избранного + первая смена — в фоне, чтобы трей появился сразу */
+    { HANDLE h = CreateThread(NULL, 0, startup_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
