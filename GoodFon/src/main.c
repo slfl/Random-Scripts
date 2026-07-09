@@ -1614,18 +1614,42 @@ static void sync_favorites(void)
     char base[64]; base_url(base, sizeof(base));
     char url[512];
 
-    /* страница 1 -> определить число страниц по ссылкам &page=N */
-    snprintf(url, sizeof(url), "%s/user/%s/favorite/", base, login);
-    HttpResp r;
-    if (!http_request("GET", url, NULL, NULL, 15000, BODY_LIMIT, &r) ||
-        r.status != 200 || !r.body) {
-        LOG_WARN("Синк избранного отменён: страница избранного недоступна (статус %d).", r.status);
-        free(r.body); return;
+    /* Число страниц берём ТОЛЬКО из доверенного чтения страницы 1 — где реально
+     * присутствует пагинатор. Иначе страница могла прийти обрезанной (частый 502),
+     * и мы недосчитаем страницы -> удалим то, что на самом деле в избранном. */
+    int M = 0;
+    for (int t = 0; t < 8; t++) {
+        snprintf(url, sizeof(url), "%s/user/%s/favorite/", base, login);
+        HttpResp r;
+        if (!http_request("GET", url, NULL, NULL, 15000, BODY_LIMIT, &r) ||
+            r.status != 200 || !r.body) { free(r.body); Sleep(400); continue; }
+        /* пагинатор в самом низу страницы; нет его — страница обрезана, не доверяем */
+        if (!strstr(r.body, "paginator")) {
+            LOG_WARN("Синк: чтение пагинации неполное (%d байт), повтор.", r.status ? (int)strlen(r.body) : 0);
+            free(r.body); Sleep(500); continue;
+        }
+        int m = 1;
+        /* из ссылок ?&page=N */
+        const char *p = r.body;
+        while ((p = strstr(p, "&page=")) != NULL) { int v = atoi(p + 6); if (v > m) m = v; p += 6; }
+        /* и из "X из M" в блоке paginator__page (берём максимум чисел) */
+        const char *pp = strstr(r.body, "paginator__page");
+        if (pp) {
+            const char *end = strstr(pp, "</div>");
+            const char *q = pp + 15;
+            while ((q = strpbrk(q, "0123456789")) != NULL && (!end || q < end)) {
+                int v = atoi(q); if (v > m) m = v;
+                while (*q >= '0' && *q <= '9') q++;
+            }
+        }
+        free(r.body);
+        M = m;
+        break;
     }
-    int M = 1;
-    { const char *p = r.body;
-      while ((p = strstr(p, "&page=")) != NULL) { int v = atoi(p + 6); if (v > M) M = v; p += 6; } }
-    free(r.body);
+    if (M == 0) {
+        LOG_WARN("Синк избранного ОТМЕНЁН: не удалось надёжно прочитать пагинацию — ничего не удаляем.");
+        return;
+    }
     if (M > 1000) M = 1000;   /* защита от абсурда */
     LOG_INFO("Синк избранного: страниц на сайте %d", M);
 
@@ -1675,6 +1699,15 @@ static void sync_favorites(void)
 
     if (site.n == 0) {
         LOG_WARN("Синк избранного отменён: список с сайта пуст.");
+        set_free(&site); return;
+    }
+
+    /* Второй рубеж: на M страницах должно быть минимум 24*(M-1)+1 картинок
+     * (каждая НЕпоследняя страница = ровно 24). Собрали меньше -> где-то
+     * недочитали, НЕ удаляем ничего. */
+    if (site.n < 24 * (M - 1) + 1) {
+        LOG_WARN("Синк избранного ОТМЕНЁН: собрано %d, ожидалось >= %d (страниц %d) — ничего не удаляем.",
+                 site.n, 24 * (M - 1) + 1, M);
         set_free(&site); return;
     }
 
