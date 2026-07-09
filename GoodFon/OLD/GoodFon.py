@@ -1,4 +1,6 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import random
 import os
@@ -82,6 +84,20 @@ BROWSER_HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
 }
+
+
+def _mount_retries(s: requests.Session):
+    """Авто-повтор на шлюзовые ошибки 502/503/504 с нарастающей паузой."""
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,            # паузы ~1.5с, 3с, 6с
+        status_forcelist=[502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
 
 # Активный домен задаётся в main() через init_domain(); здесь — значения по умолчанию.
 BASE             = "https://www.goodfon.com"
@@ -232,6 +248,7 @@ def get_csrf_token_from_page(html: str) -> str:
 def login_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(BROWSER_HEADERS)
+    _mount_retries(s)
     r = s.get(LOGIN_URL, timeout=15)
     token = get_csrf_token_from_page(r.text)
     payload = {"csrfmiddlewaretoken": token, "login": LOGIN, "password": PASSWORD}
@@ -248,10 +265,13 @@ def login_session() -> requests.Session:
         or '"fail"' in text
         or "не угадали" in text
     )
-    if resp.status_code >= 400 or fail_mark or not (json_ok or has_session):
+    if fail_mark:
         raise RuntimeError("Неверный логин или пароль.")
-    log.info("Авторизация успешна")
-    return s
+    if json_ok or has_session:
+        log.info("Авторизация успешна")
+        return s
+    # Не успех и не явный отказ — сервер ответил ошибкой/мусором (502 и т.п.).
+    raise ConnectionError(f"неожиданный ответ сервера (статус {resp.status_code})")
 
 
 def login_session_retry() -> requests.Session:
@@ -303,6 +323,7 @@ def build_session_from_cache(cookie_str: str, base: str) -> requests.Session:
     """Поднимает сессию из сохранённых cookie указанного домена."""
     s = requests.Session()
     s.headers.update(BROWSER_HEADERS)
+    _mount_retries(s)
     host = urlparse(base).hostname
     for part in cookie_str.split(";"):
         part = part.strip()

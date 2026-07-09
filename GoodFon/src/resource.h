@@ -1,0 +1,6 @@
+#ifndef GOODFON_RESOURCE_H
+#define GOODFON_RESOURCE_H
+
+#define IDI_APPICON 101
+
+#endif
