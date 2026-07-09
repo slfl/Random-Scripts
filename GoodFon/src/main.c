@@ -45,6 +45,7 @@
 #define IDM_AUTOSTART   104
 #define IDM_EXIT        105
 #define IDM_SETCREDS    107
+#define IDM_NOTIFY      108
 #define IDM_INT_BASE    200   /* интервал смены: 5/10/30/60 мин   */
 #define IDM_LIKEN_BASE  220   /* интервал избранного: 5/10/15/20  */
 #define IDM_RES_BASE    240   /* разрешение: HD/FullHD/2K/4K/Ориг */
@@ -1800,6 +1801,8 @@ static void show_menu(void)
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_SETCREDS, L"Изменить логин и пароль…");
     AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, L"Пауза");
+    AppendMenuW(m, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0),
+                IDM_NOTIFY, L"Включить уведомления");
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
                 IDM_AUTOSTART, L"Автозапуск с Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -1853,6 +1856,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             run_async(id);
         else if (id == IDM_SETCREDS) prompt_credentials();
         else if (id == IDM_PAUSE) { g_paused = !g_paused; apply_interval(); }
+        else if (id == IDM_NOTIFY) {
+            g_cfg.notify = !g_cfg.notify;
+            reg_set_dword(L"notify", g_cfg.notify);
+            LOG_INFO("Уведомления: %s", g_cfg.notify ? "вкл" : "выкл");
+        }
         else if (id == IDM_AUTOSTART) autostart_toggle();
         else if (id == IDM_EXIT) DestroyWindow(h);
         else if (id >= IDM_INT_BASE && id < IDM_INT_BASE + 4) {
