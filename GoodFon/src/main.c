@@ -67,6 +67,7 @@ static const ResDef g_reses[] = {
     { L"Full HD (1920x1080)", "1920x1080" },
     { L"2K (2560x1440)",      "2560x1440" },
     { L"4K (3840x2160)",      "3840x2160" },
+    { L"8K (7680x4320)",      "7680x4320" },
     { L"Оригинал (любое)",    "original"  },
 };
 #define RES_COUNT (int)(sizeof(g_reses)/sizeof(g_reses[0]))
@@ -112,6 +113,17 @@ static const ThemeDef g_themes_all[] = {
     { "flowers",     L"Цветы"        },
 };
 #define THEME_COUNT (int)(sizeof(g_themes_all)/sizeof(g_themes_all[0]))
+
+/* Сортировка тем по алфавиту (по отображаемому имени, локале-зависимо).
+ * Сортируем массив ИНДЕКСОВ, чтобы ID пунктов меню по-прежнему указывали
+ * на исходные записи g_themes_all. */
+static int theme_cmp(const void *a, const void *b)
+{
+    int ia = *(const int *)a, ib = *(const int *)b;
+    int r = CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE,
+                           g_themes_all[ia].name, -1, g_themes_all[ib].name, -1);
+    return r - 2;   /* CSTR_LESS_THAN(1)->-1, EQUAL(2)->0, GREATER(3)->1 */
+}
 
 /* Маркеры ответа логина/квоты (UTF-8, как приходит с сайта) */
 #define QUOTA_MARKER_RU  "\xD0\xB8\xD1\x81\xD1\x87\xD0\xB5\xD1\x80\xD0\xBF\xD0\xB0\xD0\xBB\xD0\xB8" /* "исчерпали" */
@@ -1131,7 +1143,8 @@ static void make_absolute(const char *href, char *out, size_t sz)
 static void resolution_band(int *tw, int *th, int *nw, int *nh)
 {
     static const int tiers[][2] = {
-        {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}, {8400, 3600}
+        {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160},
+        {7680, 4320}, {10240, 5760}
     };
     const int ntiers = (int)(sizeof(tiers) / sizeof(tiers[0]));
     *tw = 0; *th = 0;
@@ -1999,7 +2012,11 @@ static void show_menu(void)
 
     HMENU mt = CreatePopupMenu();
     int authed = is_authorized();
-    for (int i = 0; i < THEME_COUNT; i++) {
+    int order[THEME_COUNT];
+    for (int i = 0; i < THEME_COUNT; i++) order[i] = i;
+    qsort(order, THEME_COUNT, sizeof(int), theme_cmp);
+    for (int k = 0; k < THEME_COUNT; k++) {
+        int i = order[k];
         UINT fl = MF_STRING |
             (!_stricmp(g_themes_all[i].slug, g_cfg.theme) ? MF_CHECKED : 0);
         /* "Эротика" доступна только после авторизации */
