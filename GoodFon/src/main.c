@@ -496,7 +496,7 @@ static int settings_load(void)
     WCHAR wtheme[64];
     utf8_to_wide(g_cfg.theme, wtheme, 64);
     wcscpy(g_like_dir, wsave);
-    PathAppendW(g_like_dir, L"Like");
+    PathAppendW(g_like_dir, L"Favorite");
     PathAppendW(g_like_dir, wtheme);
 
     strncpy(g_jar_com, g_cfg.session_com, JAR_SIZE - 1);
@@ -1403,17 +1403,17 @@ static void fallback_local(int like_only)
 static int set_wallpaper_from_like(void)
 {
     char d8[MAX_PATH * 3]; wide_to_utf8(g_like_dir, d8, sizeof(d8));
-    LOG_INFO("Like-папка: %s (найдено файлов: %d)", d8, dir_count(g_like_dir));
+    LOG_INFO("Favorite-папка: %s (найдено файлов: %d)", d8, dir_count(g_like_dir));
 
     WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
     WCHAR chosen[MAX_PATH];
     if (!random_file_excluding(g_like_dir, cur, chosen, MAX_PATH)) {
-        LOG_WARN("Папка Like/%s пуста, загружаем с сайта", g_cfg.theme);
+        LOG_WARN("Папка Favorite/%s пуста, загружаем с сайта", g_cfg.theme);
         return 0;
     }
     set_wallpaper(chosen);
     char p8[MAX_PATH * 3]; wide_to_utf8(chosen, p8, sizeof(p8));
-    LOG_INFO("Обои из папки Like/%s: %s", g_cfg.theme, p8);
+    LOG_INFO("Обои из папки Favorite/%s: %s", g_cfg.theme, p8);
     WCHAR info[300]; _snwprintf(info, 300, L"%s", PathFindFileNameW(chosen));
     notify_user(L"Обои обновлены — из избранного", info);
     return 1;
@@ -1433,11 +1433,11 @@ static void do_update(void)
 
     g_cfg.counter++;
     counter_save();
-    LOG_INFO("Запуск #%d (из Like каждые %d)", g_cfg.counter, g_cfg.like_every_n);
+    LOG_INFO("Запуск #%d (из Favorite каждые %d)", g_cfg.counter, g_cfg.like_every_n);
     if (g_cfg.counter >= g_cfg.like_every_n) {
         g_cfg.counter = 0; counter_save();
         if (set_wallpaper_from_like()) return;
-        LOG_INFO("Папка Like пуста, продолжаем загрузку с сайта");
+        LOG_INFO("Папка Favorite пуста, продолжаем загрузку с сайта");
     }
 
     /* Ищем картинку с нужным разрешением. Перебираем много изображений
@@ -1544,7 +1544,7 @@ static void do_like(void)
     _snwprintf(dest, MAX_PATH, L"%s\\%s", g_like_dir, PathFindFileNameW(last));
     if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) {
         CopyFileW(last, dest, FALSE);
-        LOG_INFO("Изображение скопировано в папку Like/%s", g_cfg.theme);
+        LOG_INFO("Изображение скопировано в папку Favorite/%s", g_cfg.theme);
     }
     set_wallpaper(dest); /* чтобы unlike корректно определил текущую */
 
@@ -1566,7 +1566,7 @@ static void do_unlike(void)
     }
     WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
     if (!cur[0] || StrStrIW(cur, g_like_dir) != cur) {
-        LOG_ERROR("Текущие обои не из папки Like — unlike невозможен.");
+        LOG_ERROR("Текущие обои не из папки Favorite — unlike невозможен.");
         notify_user(L"GoodFon: ошибка", L"Текущие обои не из папки избранного.");
         return;
     }
@@ -1577,7 +1577,7 @@ static void do_unlike(void)
     else
         LOG_WARN("Не удалось удалить из избранного на сайте.");
     if (DeleteFileW(cur)) {
-        LOG_INFO("Файл удалён из папки Like");
+        LOG_INFO("Файл удалён из папки Favorite");
         WCHAR info[300]; _snwprintf(info, 300, L"%s", PathFindFileNameW(cur));
         notify_user(L"Удалено из избранного", info);
     }
@@ -1736,14 +1736,14 @@ static void sync_favorites(void)
     }
 
     /* Удаление локальных картинок, которых нет в избранном на сайте.
-     * Чистим корень Like и все подпапки Like\<тема> (сайт плоский). */
+     * Чистим корень Favorite и все подпапки Favorite\<тема> (сайт плоский). */
     WCHAR wsave[MAX_PATH], like_base[MAX_PATH];
     utf8_to_wide(g_cfg.save_dir, wsave, MAX_PATH);
-    wcscpy(like_base, wsave); PathAppendW(like_base, L"Like");
+    wcscpy(like_base, wsave); PathAppendW(like_base, L"Favorite");
 
     int deleted = 0, kept = 0;
 
-    /* список директорий для чистки: сам Like + его подпапки */
+    /* список директорий для чистки: сам Favorite + его подпапки */
     WCHAR dirs[128][MAX_PATH]; int nd = 0;
     wcscpy(dirs[nd++], like_base);
     WCHAR pat[MAX_PATH]; _snwprintf(pat, MAX_PATH, L"%s\\*", like_base);
@@ -2121,12 +2121,12 @@ static void select_theme(int idx)
     strncpy(g_cfg.theme, g_themes_all[idx].slug, sizeof(g_cfg.theme) - 1);
     g_cfg.theme[sizeof(g_cfg.theme) - 1] = 0;
     reg_set_str(L"theme", g_cfg.theme);
-    /* пересчёт Like-папки под новую тему */
+    /* пересчёт Favorite-папки под новую тему */
     WCHAR wsave[MAX_PATH], wtheme[64];
     utf8_to_wide(g_cfg.save_dir, wsave, MAX_PATH);
     utf8_to_wide(g_cfg.theme, wtheme, 64);
     wcscpy(g_like_dir, wsave);
-    PathAppendW(g_like_dir, L"Like");
+    PathAppendW(g_like_dir, L"Favorite");
     PathAppendW(g_like_dir, wtheme);
     LOG_INFO("Активная тема: %s (сменится по таймеру или вручную)", g_cfg.theme);
 }
