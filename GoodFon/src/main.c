@@ -46,6 +46,9 @@
 #define IDM_EXIT        105
 #define IDM_SETCREDS    107
 #define IDM_NOTIFY      108
+#define IDM_REGISTER    109
+#define IDM_LOGOUT      110
+#define IDM_LOGIN       111   /* внутреннее действие: асинхронный вход после ввода данных */
 #define IDM_INT_BASE    200   /* интервал смены: 5/10/30/60 мин   */
 #define IDM_LIKEN_BASE  220   /* интервал избранного: 5/10/15/20  */
 #define IDM_RES_BASE    240   /* разрешение: HD/FullHD/2K/4K/Ориг */
@@ -557,11 +560,11 @@ static int config_get(const char *section, const char *key, char *out, size_t ou
  * Используется для гейтинга раздела "Эротика" (доступен только после входа). */
 static int is_authorized(void)
 {
-    if (g_jar_com[0] || g_jar_ru[0]) return 1;
-    if (g_cfg.login[0] && strcmp(g_cfg.login, "your_login") &&
-        g_cfg.password[0] && strcmp(g_cfg.password, "your_password"))
-        return 1;
-    return 0;
+    /* Авторизован = в приложении заданы логин и пароль. Одного кэша cookie
+     * без логина недостаточно (иначе старая сессия разблокировала бы разделы
+     * даже после выхода / на «чистом» первом запуске). */
+    return (g_cfg.login[0] && strcmp(g_cfg.login, "your_login") &&
+            g_cfg.password[0] && strcmp(g_cfg.password, "your_password"));
 }
 
 static char *jar_for(int domain) { return domain == 1 ? g_jar_ru : g_jar_com; }
@@ -1065,6 +1068,11 @@ static int do_login(void)
 /* Выбор домена + сессии: кэш напрямую, иначе логин с повтором. 1 = ок */
 static int ensure_session(void)
 {
+    /* Нет логина/пароля — не дёргаем сеть впустую, работаем из локального избранного. */
+    if (!is_authorized()) {
+        LOG_INFO("Вход не выполняется: логин и пароль не заданы.");
+        return 0;
+    }
     int order[2]; domain_order(order);
     for (int i = 0; i < 2; i++) {
         g_active_domain = order[i];
@@ -1414,7 +1422,10 @@ static int set_wallpaper_from_like(void)
 static void do_update(void)
 {
     if (!ensure_session()) {
-        LOG_ERROR("Ни один домен недоступен или вход не выполнен.");
+        if (is_authorized())
+            LOG_ERROR("Ни один домен недоступен или вход не выполнен.");
+        else
+            LOG_INFO("Вход не выполнен (нет логина) — берём картинку локально.");
         g_cfg.counter++; counter_save();
         fallback_local(0);
         return;
@@ -1818,6 +1829,15 @@ static DWORD WINAPI worker_thread(LPVOID param)
         case IDM_UPDATE: do_update(); break;
         case IDM_LIKE:   do_like();   break;
         case IDM_UNLIKE: do_unlike(); break;
+        case IDM_LOGIN:
+            if (ensure_session()) {
+                LOG_INFO("Авторизация через меню успешна.");
+                notify_user(L"GoodFon", L"Авторизация успешна.");
+            } else {
+                LOG_WARN("Авторизация через меню не удалась (проверьте логин и пароль).");
+                notify_user(L"GoodFon", L"Не удалось войти: проверьте логин и пароль.");
+            }
+            break;
     }
     InterlockedExchange(&g_busy, 0);
     return 0;
@@ -1862,17 +1882,17 @@ static LRESULT CALLBACK CredProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         CreateWindowW(L"STATIC", L"Логин:", WS_CHILD | WS_VISIBLE,
                       12, 14, 70, 20, h, NULL, g_hinst, NULL);
         eLogin = CreateWindowW(L"EDIT", g_dlg_login,
-                      WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                      WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                       90, 12, 190, 24, h, (HMENU)1001, g_hinst, NULL);
         CreateWindowW(L"STATIC", L"Пароль:", WS_CHILD | WS_VISIBLE,
                       12, 48, 70, 20, h, NULL, g_hinst, NULL);
         ePass = CreateWindowW(L"EDIT", g_dlg_pass,
-                      WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
+                      WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
                       90, 46, 190, 24, h, (HMENU)1002, g_hinst, NULL);
-        CreateWindowW(L"BUTTON", L"Сохранить",
-                      WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        CreateWindowW(L"BUTTON", L"Войти",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                       90, 84, 100, 28, h, (HMENU)IDOK, g_hinst, NULL);
-        CreateWindowW(L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE,
+        CreateWindowW(L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                       195, 84, 85, 28, h, (HMENU)IDCANCEL, g_hinst, NULL);
         SetFocus(eLogin);
         return 0;
@@ -1893,6 +1913,45 @@ static LRESULT CALLBACK CredProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
+}
+
+/* Открыть страницу регистрации сайта в браузере (в приложении нельзя из-за
+ * reCAPTCHA на форме регистрации). */
+static void select_theme(int idx);   /* fwd */
+
+static void account_register(void)
+{
+    char base[64]; base_url(base, sizeof(base));
+    char url8[128]; snprintf(url8, sizeof(url8), "%s/auth/registration/", base);
+    WCHAR url[128]; utf8_to_wide(url8, url, 128);
+    ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+    LOG_INFO("Открыта страница регистрации: %s", url8);
+    notify_user(L"GoodFon",
+                L"Открыл регистрацию в браузере. После неё войдите через «Авторизация…».");
+}
+
+/* Локальный выход из аккаунта: чистим логин/пароль/сессии. Сайт не трогаем. */
+static void account_logout(void)
+{
+    g_cfg.login[0] = 0; g_cfg.password[0] = 0;
+    g_jar_com[0] = 0;   g_jar_ru[0] = 0;
+    reg_set_str(L"login", "");
+    reg_set_str(L"session_com", "");
+    reg_set_str(L"session_ru", "");
+    HKEY k = reg_open(KEY_WRITE);
+    if (k) { RegDeleteValueW(k, L"password_enc"); RegCloseKey(k); }
+
+    /* Раздел "Эротика" доступен только с авторизацией — при выходе уходим с него. */
+    if (!_stricmp(g_cfg.theme, "erotic")) {
+        int gi = -1;
+        for (int i = 0; i < THEME_COUNT; i++)
+            if (!_stricmp(g_themes_all[i].slug, "girls")) { gi = i; break; }
+        if (gi >= 0) select_theme(gi);
+        LOG_INFO("Тема переключена с \"erotic\" на \"girls\" (выход из аккаунта).");
+    }
+
+    LOG_INFO("Выход из аккаунта: локальные учётные данные и кэш сессий очищены.");
+    notify_user(L"GoodFon", L"Выход из аккаунта выполнен.");
 }
 
 static void prompt_credentials(void)
@@ -1951,12 +2010,12 @@ static void prompt_credentials(void)
         strncpy(g_cfg.password, p8, sizeof(g_cfg.password) - 1);
         reg_set_str(L"login", g_cfg.login);
         reg_set_password(g_cfg.password);
-        /* смена логина делает старый кэш недействительным — чистим */
+        /* смена логина делает старый кэш недействительным — чистим и логинимся заново */
         g_jar_com[0] = 0; g_jar_ru[0] = 0;
         reg_set_str(L"session_com", "");
         reg_set_str(L"session_ru", "");
-        LOG_INFO("Логин/пароль обновлены через меню, кэш сессий сброшен.");
-        notify_user(L"GoodFon", L"Логин и пароль сохранены.");
+        LOG_INFO("Логин/пароль сохранены, выполняю вход…");
+        run_async(IDM_LOGIN);   /* сразу авторизуемся и тянем сессию/куки */
     }
 }
 
@@ -2027,7 +2086,13 @@ static void show_menu(void)
     AppendMenuW(m, MF_POPUP, (UINT_PTR)mt, L"Тема");
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, IDM_SETCREDS, L"Изменить логин и пароль…");
+    HMENU macc = CreatePopupMenu();
+    if (!is_authorized())
+        AppendMenuW(macc, MF_STRING, IDM_REGISTER, L"Регистрация на сайте…");
+    AppendMenuW(macc, MF_STRING, IDM_SETCREDS, L"Авторизация…");
+    if (is_authorized())
+        AppendMenuW(macc, MF_STRING, IDM_LOGOUT, L"Выйти из аккаунта");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)macc, L"Аккаунт");
     AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, L"Пауза");
     AppendMenuW(m, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0),
                 IDM_NOTIFY, L"Включить уведомления");
@@ -2083,6 +2148,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (id == IDM_UPDATE || id == IDM_LIKE || id == IDM_UNLIKE)
             run_async(id);
         else if (id == IDM_SETCREDS) prompt_credentials();
+        else if (id == IDM_REGISTER) account_register();
+        else if (id == IDM_LOGOUT)   account_logout();
         else if (id == IDM_PAUSE) { g_paused = !g_paused; apply_interval(); }
         else if (id == IDM_NOTIFY) {
             g_cfg.notify = !g_cfg.notify;
@@ -2112,7 +2179,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             int idx = id - IDM_THEME_BASE;
             if (!_stricmp(g_themes_all[idx].slug, "erotic") && !is_authorized()) {
                 LOG_WARN("Раздел \"Эротика\" доступен только после авторизации.");
-                notify_user(L"GoodFon", L"Раздел «Эротика» доступен только после входа.");
+                MessageBoxW(NULL, L"Доступно после авторизации.",
+                            APP_NAME, MB_ICONINFORMATION | MB_TOPMOST);
             } else
                 select_theme(idx);
         }
