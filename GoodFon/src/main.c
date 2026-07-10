@@ -37,6 +37,14 @@
 #define WM_TRAYICON     (WM_APP + 1)
 #define TIMER_ID        1
 
+/* ================= Язык интерфейса и логов ================= */
+enum { LANG_RU = 0, LANG_EN = 1 };
+static int g_lang = LANG_RU;
+/* Вернуть строку по текущему языку. Литералы передаются парой (ru, en). */
+static const char  *T (const char *ru, const char *en)  { return g_lang == LANG_EN ? en : ru; }
+static const WCHAR *TW(const WCHAR *ru, const WCHAR *en) { return g_lang == LANG_EN ? en : ru; }
+
+
 /* Пункты меню */
 #define IDM_UPDATE      100
 #define IDM_LIKE        101
@@ -49,6 +57,8 @@
 #define IDM_REGISTER    109
 #define IDM_LOGOUT      110
 #define IDM_LOGIN       111   /* внутреннее действие: асинхронный вход после ввода данных */
+#define IDM_LANG_RU     112
+#define IDM_LANG_EN     113
 #define IDM_INT_BASE    200   /* интервал смены: 5/10/30/60 мин   */
 #define IDM_LIKEN_BASE  220   /* интервал избранного: 5/10/15/20  */
 #define IDM_RES_BASE    240   /* разрешение: HD/FullHD/2K/4K/Ориг */
@@ -75,47 +85,51 @@ static const ResDef g_reses[] = {
 };
 #define RES_COUNT (int)(sizeof(g_reses)/sizeof(g_reses[0]))
 
-/* Встроенный список тем: slug для URL + русское имя для меню.
+/* Встроенный список тем: slug для URL + имя для меню (ru/en).
  * anime/auto на goodfon живут на поддоменах — здесь не включены.       */
-typedef struct { const char *slug; const wchar_t *name; } ThemeDef;
+typedef struct { const char *slug; const wchar_t *name_ru; const wchar_t *name_en; } ThemeDef;
 static const ThemeDef g_themes_all[] = {
-    { "erotic",      L"Эротика"      },
-    { "girls",       L"Девушки"      },
-    { "nature",      L"Природа"      },
-    { "landscapes",  L"Пейзажи"      },
-    { "hi-tech",     L"Hi-Tech"      },
-    { "abstraction", L"Абстракции"   },
-    { "aviation",    L"Авиация"      },
-    { "city",        L"Город"        },
-    { "food",        L"Еда"          },
-    { "painting",    L"Живопись"     },
-    { "animals",     L"Животные"     },
-    { "games",       L"Игры"         },
-    { "ai-art",      L"ИИ арт"       },
-    { "interior",    L"Интерьер"     },
-    { "space",       L"Космос"       },
-    { "cats",        L"Кошки"        },
-    { "Love",        L"Любовь"       },
-    { "macro",       L"Макро"        },
-    { "minimalism",  L"Минимализм"   },
-    { "men",         L"Мужчины"      },
-    { "music",       L"Музыка"       },
-    { "mood",        L"Настроения"   },
-    { "new-year",    L"Новый год"    },
-    { "weapon",      L"Оружие"       },
-    { "holidays",    L"Праздники"    },
-    { "miscellanea", L"Разное"       },
-    { "rendering",   L"Рендеринг"    },
-    { "situations",  L"Ситуации"     },
-    { "dog",         L"Собаки"       },
-    { "sports",      L"Спорт"        },
-    { "style",       L"Стиль"        },
-    { "textures",    L"Текстуры"     },
-    { "fantasy",     L"Фантастика"   },
-    { "films",       L"Фильмы"       },
-    { "flowers",     L"Цветы"        },
+    { "erotic",      L"Эротика",      L"Erotic"       },
+    { "girls",       L"Девушки",      L"Girls"        },
+    { "nature",      L"Природа",      L"Nature"       },
+    { "landscapes",  L"Пейзажи",      L"Landscapes"   },
+    { "hi-tech",     L"Hi-Tech",      L"Hi-Tech"      },
+    { "abstraction", L"Абстракции",   L"Abstraction"  },
+    { "aviation",    L"Авиация",      L"Aviation"     },
+    { "city",        L"Город",        L"City"         },
+    { "food",        L"Еда",          L"Food"         },
+    { "painting",    L"Живопись",     L"Painting"     },
+    { "animals",     L"Животные",     L"Animals"      },
+    { "games",       L"Игры",         L"Games"        },
+    { "ai-art",      L"ИИ арт",       L"AI Art"       },
+    { "interior",    L"Интерьер",     L"Interior"     },
+    { "space",       L"Космос",       L"Space"        },
+    { "cats",        L"Кошки",        L"Cats"         },
+    { "Love",        L"Любовь",       L"Love"         },
+    { "macro",       L"Макро",        L"Macro"        },
+    { "minimalism",  L"Минимализм",   L"Minimalism"   },
+    { "men",         L"Мужчины",      L"Men"          },
+    { "music",       L"Музыка",       L"Music"        },
+    { "mood",        L"Настроения",   L"Mood"         },
+    { "new-year",    L"Новый год",    L"New Year"     },
+    { "weapon",      L"Оружие",       L"Weapon"       },
+    { "holidays",    L"Праздники",    L"Holidays"     },
+    { "miscellanea", L"Разное",       L"Miscellanea"  },
+    { "rendering",   L"Рендеринг",    L"Rendering"    },
+    { "situations",  L"Ситуации",     L"Situations"   },
+    { "dog",         L"Собаки",       L"Dogs"         },
+    { "sports",      L"Спорт",        L"Sports"       },
+    { "style",       L"Стиль",        L"Style"        },
+    { "textures",    L"Текстуры",     L"Textures"     },
+    { "fantasy",     L"Фантастика",   L"Fantasy"      },
+    { "films",       L"Фильмы",       L"Films"        },
+    { "flowers",     L"Цветы",        L"Flowers"      },
 };
 #define THEME_COUNT (int)(sizeof(g_themes_all)/sizeof(g_themes_all[0]))
+
+/* Имя темы по текущему языку. */
+static const wchar_t *theme_name(int i)
+{ return g_lang == LANG_EN ? g_themes_all[i].name_en : g_themes_all[i].name_ru; }
 
 /* Сортировка тем по алфавиту (по отображаемому имени, локале-зависимо).
  * Сортируем массив ИНДЕКСОВ, чтобы ID пунктов меню по-прежнему указывали
@@ -124,7 +138,7 @@ static int theme_cmp(const void *a, const void *b)
 {
     int ia = *(const int *)a, ib = *(const int *)b;
     int r = CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE,
-                           g_themes_all[ia].name, -1, g_themes_all[ib].name, -1);
+                           theme_name(ia), -1, theme_name(ib), -1);
     return r - 2;   /* CSTR_LESS_THAN(1)->-1, EQUAL(2)->0, GREATER(3)->1 */
 }
 
@@ -424,7 +438,7 @@ static int migrate_ini_to_registry(void)
     if (config_get("settings", "notify", v, sizeof(v)))       reg_set_dword(L"notify", !_stricmp(v, "true"));
     if (config_get("settings", "interval_min", v, sizeof(v))) reg_set_dword(L"interval_min", atoi(v));
     if (config_get("state", "counter", v, sizeof(v)))         reg_set_dword(L"counter", atoi(v));
-    LOG_INFO("Настройки перенесены из config.ini в реестр HKCU\\Software\\GoodFon");
+    LOG_INFO(T("Настройки перенесены из config.ini в реестр HKCU\\Software\\GoodFon", "Settings migrated from config.ini to registry key HKCU/Software/GoodFon"));
     return 1;
 }
 
@@ -444,8 +458,9 @@ static void settings_write_defaults(void)
     reg_set_dword(L"notify", 1);
     reg_set_dword(L"interval_min", 10);
     reg_set_dword(L"counter", 0);
+    reg_set_str(L"Language", "russian");
     /* password_enc не пишем — пароль появится, когда его введут через меню */
-    LOG_INFO("Реестр пуст — созданы значения по умолчанию в HKCU\\Software\\GoodFon");
+    LOG_INFO(T("Реестр пуст — созданы значения по умолчанию в HKCU\\Software\\GoodFon", "Registry empty — default values created in HKCU/Software/GoodFon"));
 }
 
 static int settings_load(void)
@@ -463,6 +478,12 @@ static int settings_load(void)
     reg_get_password(g_cfg.password, sizeof(g_cfg.password));
     reg_get_str(L"session_com", g_cfg.session_com, JAR_SIZE);
     reg_get_str(L"session_ru", g_cfg.session_ru, JAR_SIZE);
+
+    /* Язык — читаем как можно раньше, чтобы и первые логи были на нужном языке. */
+    { char lang[16];
+      if (reg_get_str(L"Language", lang, sizeof(lang)) && !_stricmp(lang, "english"))
+          g_lang = LANG_EN;
+      else g_lang = LANG_RU; }
 
     if (!reg_get_str(L"resolution", g_cfg.resolution, sizeof(g_cfg.resolution)) || !g_cfg.resolution[0])
         strcpy(g_cfg.resolution, "1920x1080");
@@ -504,9 +525,9 @@ static int settings_load(void)
 
     {
         char l8[MAX_PATH * 3]; wide_to_utf8(g_like_dir, l8, sizeof(l8));
-        LOG_INFO("Настройки загружены из реестра. Тема: %s | save_dir: %s",
+        LOG_INFO(T("Настройки загружены из реестра. Тема: %s | save_dir: %s", "Settings loaded from registry. Theme: %s | save_dir: %s"),
                  g_cfg.theme, g_cfg.save_dir);
-        LOG_INFO("Папка избранного: %s", l8);
+        LOG_INFO(T("Папка избранного: %s", "Favorites folder: %s"), l8);
     }
     return 1;
 }
@@ -609,7 +630,7 @@ static void jar_merge(int domain, const char *set_cookie)
 static void jar_save(int domain)
 {
     reg_set_str(domain == 1 ? L"session_ru" : L"session_com", jar_for(domain));
-    LOG_INFO("Кэш сессии сохранён для домена %s", g_hosts[domain]);
+    LOG_INFO(T("Кэш сессии сохранён для домена %s", "Session cache saved for domain %s"), g_hosts[domain]);
 }
 
 /* ================= HTTP (WinHTTP) ================= */
@@ -740,19 +761,19 @@ static int http_request(const char *method, const char *url,
 
         /* авто-повтор шлюзовых ошибок */
         if ((status == 502 || status == 503 || status == 504) && attempt < 2) {
-            LOG_WARN("HTTP %d %s -> статус %lu, повтор через 2с",
+            LOG_WARN(T("HTTP %d %s -> статус %lu, повтор через 2с", "HTTP %d %s -> status %lu, retry in 2s"),
                      attempt + 1, url, (unsigned long)status);
             free(out->body); out->body = NULL; out->len = 0;
             Sleep(2000);
             continue;
         }
-        LOG_INFO("HTTP %s %s -> %lu (%lu байт)",
+        LOG_INFO(T("HTTP %s %s -> %lu (%lu байт)", "HTTP %s %s -> %lu (%lu bytes)"),
                  method, url, (unsigned long)status, (unsigned long)out->len);
         ok = 1;
         break;
     }
     if (!ok)
-        LOG_WARN("HTTP %s %s -> сетевая ошибка %lu",
+        LOG_WARN(T("HTTP %s %s -> сетевая ошибка %lu", "HTTP %s %s -> network error %lu"),
                  method, url, GetLastError());
     WinHttpCloseHandle(hr);
     WinHttpCloseHandle(hc);
@@ -810,7 +831,7 @@ static int set_wallpaper(const WCHAR *path)
     char p8[MAX_PATH * 3]; wide_to_utf8(path, p8, sizeof(p8));
 
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-        LOG_ERROR("set_wallpaper: файл не существует: %s", p8);
+        LOG_ERROR(T("set_wallpaper: файл не существует: %s", "set_wallpaper: file does not exist: %s"), p8);
         return 0;
     }
 
@@ -835,7 +856,7 @@ static int set_wallpaper(const WCHAR *path)
                  (unsigned long)h1, (unsigned long)h2);
         ok = SUCCEEDED(h1) && SUCCEEDED(h2);
     } else {
-        LOG_WARN("IActiveDesktop недоступен: CoCreateInstance=0x%08lX",
+        LOG_WARN(T("IActiveDesktop недоступен: CoCreateInstance=0x%08lX", "IActiveDesktop unavailable: CoCreateInstance=0x%08lX"),
                  (unsigned long)hr);
     }
     if (SUCCEEDED(hrInit)) CoUninitialize();
@@ -844,10 +865,10 @@ static int set_wallpaper(const WCHAR *path)
         /* запасной путь без плавности */
         if (SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)path,
                                   SPIF_UPDATEINIFILE | SPIF_SENDCHANGE)) {
-            LOG_INFO("Fallback SPI_SETDESKWALLPAPER: успех");
+            LOG_INFO(T("Fallback SPI_SETDESKWALLPAPER: успех", "Fallback SPI_SETDESKWALLPAPER: success"));
             ok = 1;
         } else {
-            LOG_ERROR("SPI_SETDESKWALLPAPER: ошибка %lu", GetLastError());
+            LOG_ERROR(T("SPI_SETDESKWALLPAPER: ошибка %lu", "SPI_SETDESKWALLPAPER: error %lu"), GetLastError());
         }
     } else {
         force_refresh();
@@ -858,19 +879,19 @@ static int set_wallpaper(const WCHAR *path)
         SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, cur, 0);
         if (_wcsicmp(cur, path) != 0) {
             char c8[MAX_PATH * 3]; wide_to_utf8(cur, c8, sizeof(c8));
-            LOG_WARN("IActiveDesktop применил не наш файл (сейчас: %s) — форсим SPI", c8);
+            LOG_WARN(T("IActiveDesktop применил не наш файл (сейчас: %s) — форсим SPI", "IActiveDesktop applied a different file (now: %s) — forcing SPI"), c8);
             if (SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)path,
                                       SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
-                LOG_INFO("SPI_SETDESKWALLPAPER: успех");
+                LOG_INFO(T("SPI_SETDESKWALLPAPER: успех", "SPI_SETDESKWALLPAPER: success"));
             else {
-                LOG_ERROR("SPI_SETDESKWALLPAPER: ошибка %lu", GetLastError());
+                LOG_ERROR(T("SPI_SETDESKWALLPAPER: ошибка %lu", "SPI_SETDESKWALLPAPER: error %lu"), GetLastError());
                 ok = 0;
             }
         }
     }
 
-    if (ok) LOG_INFO("Обои выставлены: %s", p8);
-    else    LOG_ERROR("Обои НЕ выставлены: %s", p8);
+    if (ok) LOG_INFO(T("Обои выставлены: %s", "Wallpaper set: %s"), p8);
+    else    LOG_ERROR(T("Обои НЕ выставлены: %s", "Wallpaper NOT set: %s"), p8);
     return ok;
 }
 
@@ -919,7 +940,7 @@ static FileEnt *dir_scan(const WCHAR *dir, int *outN)
     HANDLE h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         char d8[MAX_PATH * 3]; wide_to_utf8(dir, d8, sizeof(d8));
-        LOG_INFO("dir_scan: папка недоступна (код %lu): %s", GetLastError(), d8);
+        LOG_INFO(T("dir_scan: папка недоступна (код %lu): %s", "dir_scan: folder unavailable (code %lu): %s"), GetLastError(), d8);
         return NULL;
     }
     int cap = 128, n = 0;
@@ -956,7 +977,7 @@ static void cleanup_old_images(void)
         for (int i = 0; i < n - g_cfg.max_files; i++) {
             if (DeleteFileW(files[i].path)) {
                 char p8[MAX_PATH * 3]; wide_to_utf8(files[i].path, p8, sizeof(p8));
-                LOG_INFO("Удалён старый файл: %s", p8);
+                LOG_INFO(T("Удалён старый файл: %s", "Deleted old file: %s"), p8);
             }
         }
     }
@@ -1057,11 +1078,11 @@ static int do_login(void)
 
     if (bad) return -1;
     if (ok || has_session) {
-        LOG_INFO("Авторизация успешна");
+        LOG_INFO(T("Авторизация успешна", "Authorization successful"));
         jar_save(g_active_domain);
         return 1;
     }
-    LOG_WARN("Неожиданный ответ сервера при входе (статус %d)", p.status);
+    LOG_WARN(T("Неожиданный ответ сервера при входе (статус %d)", "Unexpected server response on sign-in (status %d)"), p.status);
     return 0;
 }
 
@@ -1070,25 +1091,25 @@ static int ensure_session(void)
 {
     /* Нет логина/пароля — не дёргаем сеть впустую, работаем из локального избранного. */
     if (!is_authorized()) {
-        LOG_INFO("Вход не выполняется: логин и пароль не заданы.");
+        LOG_INFO(T("Вход не выполняется: логин и пароль не заданы.", "Sign-in skipped: login and password are not set."));
         return 0;
     }
     int order[2]; domain_order(order);
     for (int i = 0; i < 2; i++) {
         g_active_domain = order[i];
         if (jar_for(g_active_domain)[0]) {
-            LOG_INFO("Используется кэш сессии: %s", g_hosts[g_active_domain]);
+            LOG_INFO(T("Используется кэш сессии: %s", "Using session cache: %s"), g_hosts[g_active_domain]);
             return 1;
         }
         for (int att = 0; att < 2; att++) {
             int res = do_login();
             if (res == 1) return 1;
             if (res == -1) {
-                LOG_WARN("Не удалось войти на %s: неверный логин или пароль",
+                LOG_WARN(T("Не удалось войти на %s: неверный логин или пароль", "Failed to sign in on %s: invalid login or password"),
                          g_hosts[g_active_domain]);
                 break;
             }
-            LOG_WARN("Сетевая ошибка входа на %s (попытка %d)",
+            LOG_WARN(T("Сетевая ошибка входа на %s (попытка %d)", "Network error signing in on %s (attempt %d)"),
                      g_hosts[g_active_domain], att + 1);
         }
     }
@@ -1228,11 +1249,11 @@ static int find_image_url(const char *image_page_url, char *out, size_t outsz)
             p += 5;
         }
         if (dl_href[0] && (cw != tw || ch != th))
-            LOG_INFO("Тир %s: выбрано %dx%d", g_cfg.resolution, cw, ch);
+            LOG_INFO(T("Тир %s: выбрано %dx%d", "Tier %s: chose %dx%d"), g_cfg.resolution, cw, ch);
     }
     free(r.body);
     if (!dl_href[0]) {
-        LOG_INFO("Разрешение %s недоступно для этой картинки, пропускаем.", g_cfg.resolution);
+        LOG_INFO(T("Разрешение %s недоступно для этой картинки, пропускаем.", "Resolution %s is not available for this image, skipping."), g_cfg.resolution);
         return 0;
     }
 
@@ -1244,7 +1265,7 @@ static int find_image_url(const char *image_page_url, char *out, size_t outsz)
 
     if (strstr(d.body, QUOTA_MARKER_RU) || strstr(d.body, "download_limit")) {
         free(d.body);
-        LOG_WARN("Превышен суточный лимит скачиваний на сайте.");
+        LOG_WARN(T("Превышен суточный лимит скачиваний на сайте.", "Daily download limit on the site exceeded."));
         return -1;
     }
 
@@ -1273,7 +1294,7 @@ static int find_image_url(const char *image_page_url, char *out, size_t outsz)
     }
     free(d.body);
     if (!found)
-        LOG_WARN("Ссылка на картинку не найдена на странице загрузки.");
+        LOG_WARN(T("Ссылка на картинку не найдена на странице загрузки.", "Image link not found on the download page."));
     return found ? 1 : 0;
 }
 
@@ -1303,7 +1324,7 @@ static char *download_image(const char *url, size_t *outLen)
         HttpResp r;
         if (http_request("GET", tries[i], NULL, NULL, 20000, IMG_LIMIT, &r) &&
             r.status == 200 && str_icontains(r.ctype, "image") && r.len > 0) {
-            if (i == 1) LOG_INFO("Использован резервный img домен");
+            if (i == 1) LOG_INFO(T("Использован резервный img домен", "Used fallback img domain"));
             *outLen = r.len;
             return r.body;
         }
@@ -1333,7 +1354,7 @@ static int save_image(const char *url, const char *data, size_t len,
     DWORD wr; WriteFile(h, data, (DWORD)len, &wr, NULL);
     CloseHandle(h);
     char p8[MAX_PATH * 3]; wide_to_utf8(outPath, p8, sizeof(p8));
-    LOG_INFO("Файл сохранён: %s", p8);
+    LOG_INFO(T("Файл сохранён: %s", "File saved: %s"), p8);
     return 1;
 }
 
@@ -1362,7 +1383,7 @@ static int favorite_api(const char *page_url, int add)
         extract_attr(tag, add ? "data-add=" : "data-del=", api, sizeof(api));
     }
     free(r.body);
-    if (!api[0]) { LOG_WARN("Блок избранного не найден на странице."); return 0; }
+    if (!api[0]) { LOG_WARN(T("Блок избранного не найден на странице.", "Favorites block not found on the page.")); return 0; }
 
     char api_url[600];
     make_absolute(api, api_url, sizeof(api_url));
@@ -1387,35 +1408,35 @@ static void fallback_local(int like_only)
         got = random_file_excluding(wdir, cur, chosen, MAX_PATH);
     }
     if (!got) {
-        LOG_WARN("Fallback: локальных картинок нет, обои не изменены.");
-        notify_user(L"GoodFon: ошибка", L"Нет доступных картинок.");
+        LOG_WARN(T("Fallback: локальных картинок нет, обои не изменены.", "Fallback: no local images, wallpaper unchanged."));
+        notify_user(TW(L"GoodFon: ошибка", L"GoodFon: error"), TW(L"Нет доступных картинок.", L"No images available."));
         return;
     }
     char p8[MAX_PATH * 3]; wide_to_utf8(chosen, p8, sizeof(p8));
-    LOG_INFO("Fallback: устанавливаем локальную картинку: %s", p8);
+    LOG_INFO(T("Fallback: устанавливаем локальную картинку: %s", "Fallback: setting local image: %s"), p8);
     set_wallpaper(chosen);
     WCHAR info[300];
     _snwprintf(info, 300, L"%s", PathFindFileNameW(chosen));
-    notify_user(like_only ? L"Обои обновлены — из избранного"
-                          : L"Обои обновлены — локально", info);
+    notify_user(like_only ? TW(L"Обои обновлены — из избранного", L"Wallpaper updated — from favorites")
+                          : TW(L"Обои обновлены — локально", L"Wallpaper updated — locally"), info);
 }
 
 static int set_wallpaper_from_like(void)
 {
     char d8[MAX_PATH * 3]; wide_to_utf8(g_like_dir, d8, sizeof(d8));
-    LOG_INFO("Favorite-папка: %s (найдено файлов: %d)", d8, dir_count(g_like_dir));
+    LOG_INFO(T("Favorite-папка: %s (найдено файлов: %d)", "Favorite folder: %s (files found: %d)"), d8, dir_count(g_like_dir));
 
     WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
     WCHAR chosen[MAX_PATH];
     if (!random_file_excluding(g_like_dir, cur, chosen, MAX_PATH)) {
-        LOG_WARN("Папка Favorite/%s пуста, загружаем с сайта", g_cfg.theme);
+        LOG_WARN(T("Папка Favorite/%s пуста, загружаем с сайта", "Folder Favorite/%s is empty, downloading from site"), g_cfg.theme);
         return 0;
     }
     set_wallpaper(chosen);
     char p8[MAX_PATH * 3]; wide_to_utf8(chosen, p8, sizeof(p8));
-    LOG_INFO("Обои из папки Favorite/%s: %s", g_cfg.theme, p8);
+    LOG_INFO(T("Обои из папки Favorite/%s: %s", "Wallpaper from folder Favorite/%s: %s"), g_cfg.theme, p8);
     WCHAR info[300]; _snwprintf(info, 300, L"%s", PathFindFileNameW(chosen));
-    notify_user(L"Обои обновлены — из избранного", info);
+    notify_user(TW(L"Обои обновлены — из избранного", L"Wallpaper updated — from favorites"), info);
     return 1;
 }
 
@@ -1423,9 +1444,9 @@ static void do_update(void)
 {
     if (!ensure_session()) {
         if (is_authorized())
-            LOG_ERROR("Ни один домен недоступен или вход не выполнен.");
+            LOG_ERROR(T("Ни один домен недоступен или вход не выполнен.", "No domain available or sign-in failed."));
         else
-            LOG_INFO("Вход не выполнен (нет логина) — берём картинку локально.");
+            LOG_INFO(T("Вход не выполнен (нет логина) — берём картинку локально.", "Not signed in (no login) — using a local image."));
         g_cfg.counter++; counter_save();
         fallback_local(0);
         return;
@@ -1433,11 +1454,11 @@ static void do_update(void)
 
     g_cfg.counter++;
     counter_save();
-    LOG_INFO("Запуск #%d (из Favorite каждые %d)", g_cfg.counter, g_cfg.like_every_n);
+    LOG_INFO(T("Запуск #%d (из Favorite каждые %d)", "Run #%d (from Favorite every %d)"), g_cfg.counter, g_cfg.like_every_n);
     if (g_cfg.counter >= g_cfg.like_every_n) {
         g_cfg.counter = 0; counter_save();
         if (set_wallpaper_from_like()) return;
-        LOG_INFO("Папка Favorite пуста, продолжаем загрузку с сайта");
+        LOG_INFO(T("Папка Favorite пуста, продолжаем загрузку с сайта", "Favorite folder is empty, continuing download from site"));
     }
 
     /* Ищем картинку с нужным разрешением. Перебираем много изображений
@@ -1456,11 +1477,11 @@ static void do_update(void)
             max_pages = get_max_pages();
             if (max_pages == 0) {
                 if (++net_fails >= NET_FAIL_LIMIT) break;
-                LOG_WARN("Ошибка пагинации (сбой %d)", net_fails);
+                LOG_WARN(T("Ошибка пагинации (сбой %d)", "Pagination error (failure %d)"), net_fails);
                 Sleep(1000);
                 continue;
             }
-            LOG_INFO("Максимальное количество страниц: %d", max_pages);
+            LOG_INFO(T("Максимальное количество страниц: %d", "Maximum number of pages: %d"), max_pages);
         }
 
         int page = rand() % max_pages + 1;
@@ -1476,16 +1497,16 @@ static void do_update(void)
             r.status != 200 || !r.body) {
             int st = r.status; free(r.body);
             if (++net_fails >= NET_FAIL_LIMIT) {
-                LOG_WARN("Слишком много сетевых ошибок (последний статус %d)", st);
+                LOG_WARN(T("Слишком много сетевых ошибок (последний статус %d)", "Too many network errors (last status %d)"), st);
                 break;
             }
-            LOG_WARN("Страница раздела не загрузилась (статус %d)", st);
+            LOG_WARN(T("Страница раздела не загрузилась (статус %d)", "Section page failed to load (status %d)"), st);
             continue;
         }
         static char links[64][512];
         int n = collect_links(r.body, links, 64);
         free(r.body);
-        if (n == 0) { LOG_WARN("На странице нет обоев, пробуем другую"); continue; }
+        if (n == 0) { LOG_WARN(T("На странице нет обоев, пробуем другую", "No wallpapers on the page, trying another")); continue; }
 
         /* пробуем несколько картинок с этой страницы (без дублей) */
         int per_page = n < 6 ? n : 6;
@@ -1494,12 +1515,12 @@ static void do_update(void)
             char image_page[600];
             make_absolute(links[(start + k) % n], image_page, sizeof(image_page));
             images_tried++;
-            LOG_INFO("Проверка #%d: %s", images_tried, image_page);
+            LOG_INFO(T("Проверка #%d: %s", "Check #%d: %s"), images_tried, image_page);
 
             char img_url[600];
             int fr = find_image_url(image_page, img_url, sizeof(img_url));
             if (fr == -1) {
-                notify_user(L"GoodFon: лимит исчерпан", L"Загружаем из избранного.");
+                notify_user(TW(L"GoodFon: лимит исчерпан", L"GoodFon: limit reached"), TW(L"Загружаем из избранного.", L"Loading from favorites."));
                 fallback_local(1);
                 return;
             }
@@ -1507,7 +1528,7 @@ static void do_update(void)
 
             size_t len = 0;
             char *data = download_image(img_url, &len);
-            if (!data) { LOG_WARN("Не удалось скачать картинку, пробуем другую"); continue; }
+            if (!data) { LOG_WARN(T("Не удалось скачать картинку, пробуем другую", "Failed to download image, trying another")); continue; }
 
             WCHAR saved[MAX_PATH];
             int sok = save_image(img_url, data, len, saved, MAX_PATH);
@@ -1516,13 +1537,13 @@ static void do_update(void)
 
             cleanup_old_images();
             set_wallpaper(saved);
-            LOG_INFO("Найдено за %d проверок.", images_tried);
+            LOG_INFO(T("Найдено за %d проверок.", "Found after %d checks."), images_tried);
             WCHAR info[300]; _snwprintf(info, 300, L"%s", PathFindFileNameW(saved));
-            notify_user(L"Обои обновлены — с сайта", info);
+            notify_user(TW(L"Обои обновлены — с сайта", L"Wallpaper updated — from site"), info);
             return;
         }
     }
-    LOG_ERROR("Не найдено изображение с разрешением %s (проверено %d).",
+    LOG_ERROR(T("Не найдено изображение с разрешением %s (проверено %d).", "No image found with resolution %s (checked %d)."),
               g_cfg.resolution, images_tried);
     fallback_local(0);
 }
@@ -1530,13 +1551,13 @@ static void do_update(void)
 static void do_like(void)
 {
     if (!ensure_session()) {
-        notify_user(L"GoodFon: сайт недоступен", L"Операция с избранным невозможна.");
+        notify_user(TW(L"GoodFon: сайт недоступен", L"GoodFon: site unavailable"), TW(L"Операция с избранным невозможна.", L"Favorites operation not possible."));
         return;
     }
     WCHAR wdir[MAX_PATH]; utf8_to_wide(g_cfg.save_dir, wdir, MAX_PATH);
     WCHAR last[MAX_PATH];
     if (!last_file_in(wdir, last, MAX_PATH)) {
-        LOG_ERROR("Нет последнего скачанного файла.");
+        LOG_ERROR(T("Нет последнего скачанного файла.", "No last downloaded file."));
         return;
     }
     SHCreateDirectoryExW(NULL, g_like_dir, NULL);
@@ -1544,42 +1565,42 @@ static void do_like(void)
     _snwprintf(dest, MAX_PATH, L"%s\\%s", g_like_dir, PathFindFileNameW(last));
     if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) {
         CopyFileW(last, dest, FALSE);
-        LOG_INFO("Изображение скопировано в папку Favorite/%s", g_cfg.theme);
+        LOG_INFO(T("Изображение скопировано в папку Favorite/%s", "Image copied to folder Favorite/%s"), g_cfg.theme);
     }
     set_wallpaper(dest); /* чтобы unlike корректно определил текущую */
 
     char page_url[600];
     page_url_for_file(dest, page_url, sizeof(page_url));
     if (favorite_api(page_url, 1)) {
-        LOG_INFO("Изображение добавлено в избранное на сайте");
+        LOG_INFO(T("Изображение добавлено в избранное на сайте", "Image added to favorites on the site"));
         WCHAR info[300]; _snwprintf(info, 300, L"%s", PathFindFileNameW(dest));
-        notify_user(L"Добавлено в избранное", info);
+        notify_user(TW(L"Добавлено в избранное", L"Added to favorites"), info);
     } else
-        LOG_WARN("Не удалось добавить в избранное на сайте.");
+        LOG_WARN(T("Не удалось добавить в избранное на сайте.", "Failed to add to favorites on the site."));
 }
 
 static void do_unlike(void)
 {
     if (!ensure_session()) {
-        notify_user(L"GoodFon: сайт недоступен", L"Операция с избранным невозможна.");
+        notify_user(TW(L"GoodFon: сайт недоступен", L"GoodFon: site unavailable"), TW(L"Операция с избранным невозможна.", L"Favorites operation not possible."));
         return;
     }
     WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
     if (!cur[0] || StrStrIW(cur, g_like_dir) != cur) {
-        LOG_ERROR("Текущие обои не из папки Favorite — unlike невозможен.");
-        notify_user(L"GoodFon: ошибка", L"Текущие обои не из папки избранного.");
+        LOG_ERROR(T("Текущие обои не из папки Favorite — unlike невозможен.", "Current wallpaper is not from the Favorite folder — unlike impossible."));
+        notify_user(TW(L"GoodFon: ошибка", L"GoodFon: error"), TW(L"Текущие обои не из папки избранного.", L"Current wallpaper is not from the favorites folder."));
         return;
     }
     char page_url[600];
     page_url_for_file(cur, page_url, sizeof(page_url));
     if (favorite_api(page_url, 0))
-        LOG_INFO("Изображение удалено из избранного на сайте");
+        LOG_INFO(T("Изображение удалено из избранного на сайте", "Image removed from favorites on the site"));
     else
-        LOG_WARN("Не удалось удалить из избранного на сайте.");
+        LOG_WARN(T("Не удалось удалить из избранного на сайте.", "Failed to remove from favorites on the site."));
     if (DeleteFileW(cur)) {
-        LOG_INFO("Файл удалён из папки Favorite");
+        LOG_INFO(T("Файл удалён из папки Favorite", "File deleted from Favorite folder"));
         WCHAR info[300]; _snwprintf(info, 300, L"%s", PathFindFileNameW(cur));
-        notify_user(L"Удалено из избранного", info);
+        notify_user(TW(L"Удалено из избранного", L"Removed from favorites"), info);
     }
     do_update(); /* сразу ставим новую */
 }
@@ -1632,8 +1653,8 @@ static void sync_favorites(void)
 {
     char login[128];
     strncpy(login, g_cfg.login, sizeof(login) - 1); login[sizeof(login) - 1] = 0;
-    if (!login[0]) { LOG_INFO("Синк избранного пропущен: не задан логин."); return; }
-    if (!ensure_session()) { LOG_INFO("Синк избранного отменён: нет входа."); return; }
+    if (!login[0]) { LOG_INFO(T("Синк избранного пропущен: не задан логин.", "Favorites sync skipped: login not set.")); return; }
+    if (!ensure_session()) { LOG_INFO(T("Синк избранного отменён: нет входа.", "Favorites sync cancelled: not signed in.")); return; }
 
     char base[64]; base_url(base, sizeof(base));
     char url[512];
@@ -1649,7 +1670,7 @@ static void sync_favorites(void)
             r.status != 200 || !r.body) { free(r.body); Sleep(400); continue; }
         /* пагинатор в самом низу страницы; нет его — страница обрезана, не доверяем */
         if (!strstr(r.body, "paginator")) {
-            LOG_WARN("Синк: чтение пагинации неполное (%d байт), повтор.", r.status ? (int)strlen(r.body) : 0);
+            LOG_WARN(T("Синк: чтение пагинации неполное (%d байт), повтор.", "Sync: pagination read incomplete (%d bytes), retrying."), r.status ? (int)strlen(r.body) : 0);
             free(r.body); Sleep(500); continue;
         }
         int m = 1;
@@ -1671,11 +1692,11 @@ static void sync_favorites(void)
         break;
     }
     if (M == 0) {
-        LOG_WARN("Синк избранного ОТМЕНЁН: не удалось надёжно прочитать пагинацию — ничего не удаляем.");
+        LOG_WARN(T("Синк избранного ОТМЕНЁН: не удалось надёжно прочитать пагинацию — ничего не удаляем.", "Favorites sync CANCELLED: could not reliably read pagination — deleting nothing."));
         return;
     }
     if (M > 1000) M = 1000;   /* защита от абсурда */
-    LOG_INFO("Синк избранного: страниц на сайте %d", M);
+    LOG_INFO(T("Синк избранного: страниц на сайте %d", "Favorites sync: pages on site %d"), M);
 
     const int FULL_PAGE = 24, MAX_TRY = 10, CONVERGE = 3;
     SlugSet site; set_init(&site);
@@ -1712,17 +1733,17 @@ static void sync_favorites(void)
         else complete = clean_seen || (stable >= CONVERGE && page.n > 0);
 
         if (!complete) {
-            LOG_WARN("Синк избранного ОТМЕНЁН: страница %d прочитана неполно (собрано %d) — ничего не удаляем.",
+            LOG_WARN(T("Синк избранного ОТМЕНЁН: страница %d прочитана неполно (собрано %d) — ничего не удаляем.", "Favorites sync CANCELLED: page %d read incompletely (collected %d) — deleting nothing."),
                      pg, page.n);
             set_free(&page); set_free(&site); return;
         }
         for (int i = 0; i < page.n; i++) set_add(&site, page.a[i]);
-        LOG_INFO("Синк: страница %d прочитана (на ней %d, всего в базе %d)", pg, page.n, site.n);
+        LOG_INFO(T("Синк: страница %d прочитана (на ней %d, всего в базе %d)", "Sync: page %d read (on it %d, total %d)"), pg, page.n, site.n);
         set_free(&page);
     }
 
     if (site.n == 0) {
-        LOG_WARN("Синк избранного отменён: список с сайта пуст.");
+        LOG_WARN(T("Синк избранного отменён: список с сайта пуст.", "Favorites sync cancelled: site list is empty."));
         set_free(&site); return;
     }
 
@@ -1730,7 +1751,7 @@ static void sync_favorites(void)
      * (каждая НЕпоследняя страница = ровно 24). Собрали меньше -> где-то
      * недочитали, НЕ удаляем ничего. */
     if (site.n < 24 * (M - 1) + 1) {
-        LOG_WARN("Синк избранного ОТМЕНЁН: собрано %d, ожидалось >= %d (страниц %d) — ничего не удаляем.",
+        LOG_WARN(T("Синк избранного ОТМЕНЁН: собрано %d, ожидалось >= %d (страниц %d) — ничего не удаляем.", "Favorites sync CANCELLED: collected %d, expected >= %d (pages %d) — deleting nothing."),
                  site.n, 24 * (M - 1) + 1, M);
         set_free(&site); return;
     }
@@ -1770,13 +1791,13 @@ static void sync_favorites(void)
             if (DeleteFileW(files[i].path)) {
                 deleted++;
                 char f8[MAX_PATH * 3]; wide_to_utf8(files[i].path, f8, sizeof(f8));
-                LOG_INFO("Удалено (нет в избранном на сайте): %s", f8);
+                LOG_INFO(T("Удалено (нет в избранном на сайте): %s", "Deleted (not in favorites on site): %s"), f8);
             }
         }
         free(files);
     }
 
-    LOG_INFO("Синк избранного завершён: на сайте %d, оставлено %d, удалено %d.",
+    LOG_INFO(T("Синк избранного завершён: на сайте %d, оставлено %d, удалено %d.", "Favorites sync finished: on site %d, kept %d, deleted %d."),
              site.n, kept, deleted);
     set_free(&site);
 }
@@ -1831,11 +1852,11 @@ static DWORD WINAPI worker_thread(LPVOID param)
         case IDM_UNLIKE: do_unlike(); break;
         case IDM_LOGIN:
             if (ensure_session()) {
-                LOG_INFO("Авторизация через меню успешна.");
-                notify_user(L"GoodFon", L"Авторизация успешна.");
+                LOG_INFO(T("Авторизация через меню успешна.", "Sign-in from menu successful."));
+                notify_user(L"GoodFon", TW(L"Авторизация успешна.", L"Authorization successful."));
             } else {
-                LOG_WARN("Авторизация через меню не удалась (проверьте логин и пароль).");
-                notify_user(L"GoodFon", L"Не удалось войти: проверьте логин и пароль.");
+                LOG_WARN(T("Авторизация через меню не удалась (проверьте логин и пароль).", "Sign-in from menu failed (check login and password)."));
+                notify_user(L"GoodFon", TW(L"Не удалось войти: проверьте логин и пароль.", L"Sign-in failed: check login and password."));
             }
             break;
     }
@@ -1846,7 +1867,7 @@ static DWORD WINAPI worker_thread(LPVOID param)
 static void run_async(int action)
 {
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) {
-        LOG_WARN("Предыдущая операция ещё выполняется, пропуск.");
+        LOG_WARN(T("Предыдущая операция ещё выполняется, пропуск.", "Previous operation still running, skipping."));
         return;
     }
     HANDLE h = CreateThread(NULL, 0, worker_thread, (LPVOID)(INT_PTR)action, 0, NULL);
@@ -1879,20 +1900,20 @@ static LRESULT CALLBACK CredProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     static HWND eLogin, ePass;
     switch (msg) {
     case WM_CREATE:
-        CreateWindowW(L"STATIC", L"Логин:", WS_CHILD | WS_VISIBLE,
+        CreateWindowW(L"STATIC", TW(L"Логин:", L"Login:"), WS_CHILD | WS_VISIBLE,
                       12, 14, 70, 20, h, NULL, g_hinst, NULL);
         eLogin = CreateWindowW(L"EDIT", g_dlg_login,
                       WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                       90, 12, 190, 24, h, (HMENU)1001, g_hinst, NULL);
-        CreateWindowW(L"STATIC", L"Пароль:", WS_CHILD | WS_VISIBLE,
+        CreateWindowW(L"STATIC", TW(L"Пароль:", L"Password:"), WS_CHILD | WS_VISIBLE,
                       12, 48, 70, 20, h, NULL, g_hinst, NULL);
         ePass = CreateWindowW(L"EDIT", g_dlg_pass,
                       WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
                       90, 46, 190, 24, h, (HMENU)1002, g_hinst, NULL);
-        CreateWindowW(L"BUTTON", L"Войти",
+        CreateWindowW(L"BUTTON", TW(L"Войти", L"Sign in"),
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                       90, 84, 100, 28, h, (HMENU)IDOK, g_hinst, NULL);
-        CreateWindowW(L"BUTTON", L"Отмена", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        CreateWindowW(L"BUTTON", TW(L"Отмена", L"Cancel"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                       195, 84, 85, 28, h, (HMENU)IDCANCEL, g_hinst, NULL);
         SetFocus(eLogin);
         return 0;
@@ -1925,9 +1946,9 @@ static void account_register(void)
     char url8[128]; snprintf(url8, sizeof(url8), "%s/auth/registration/", base);
     WCHAR url[128]; utf8_to_wide(url8, url, 128);
     ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
-    LOG_INFO("Открыта страница регистрации: %s", url8);
+    LOG_INFO(T("Открыта страница регистрации: %s", "Opened registration page: %s"), url8);
     notify_user(L"GoodFon",
-                L"Открыл регистрацию в браузере. После неё войдите через «Авторизация…».");
+                TW(L"Открыл регистрацию в браузере. После неё войдите через «Авторизация…».", L"Opened registration in the browser. Then sign in via ‘Sign in…’."));
 }
 
 /* Локальный выход из аккаунта: чистим логин/пароль/сессии. Сайт не трогаем. */
@@ -1947,11 +1968,11 @@ static void account_logout(void)
         for (int i = 0; i < THEME_COUNT; i++)
             if (!_stricmp(g_themes_all[i].slug, "girls")) { gi = i; break; }
         if (gi >= 0) select_theme(gi);
-        LOG_INFO("Тема переключена с \"erotic\" на \"girls\" (выход из аккаунта).");
+        LOG_INFO(T("Тема переключена с \"erotic\" на \"girls\" (выход из аккаунта).", "Theme switched from 'erotic' to 'girls' (sign out)."));
     }
 
-    LOG_INFO("Выход из аккаунта: локальные учётные данные и кэш сессий очищены.");
-    notify_user(L"GoodFon", L"Выход из аккаунта выполнен.");
+    LOG_INFO(T("Выход из аккаунта: локальные учётные данные и кэш сессий очищены.", "Signed out: local credentials and session cache cleared."));
+    notify_user(L"GoodFon", TW(L"Выход из аккаунта выполнен.", L"Signed out."));
 }
 
 static void prompt_credentials(void)
@@ -1986,7 +2007,7 @@ static void prompt_credentials(void)
     int y = wa.top + ((wa.bottom - wa.top) - ht) / 2;
 
     HWND dh = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, cls,
-                              L"GoodFon — логин и пароль",
+                              TW(L"GoodFon — логин и пароль", L"GoodFon — login and password"),
                               WS_POPUP | WS_CAPTION | WS_SYSMENU,
                               x, y, w, ht, g_hwnd, NULL, g_hinst, NULL);
     if (!dh) return;
@@ -2014,7 +2035,7 @@ static void prompt_credentials(void)
         g_jar_com[0] = 0; g_jar_ru[0] = 0;
         reg_set_str(L"session_com", "");
         reg_set_str(L"session_ru", "");
-        LOG_INFO("Логин/пароль сохранены, выполняю вход…");
+        LOG_INFO(T("Логин/пароль сохранены, выполняю вход…", "Login/password saved, signing in…"));
         run_async(IDM_LOGIN);   /* сразу авторизуемся и тянем сессию/куки */
     }
 }
@@ -2034,40 +2055,42 @@ static void tray_add(void)
                                     GetSystemMetrics(SM_CXSMICON),
                                     GetSystemMetrics(SM_CYSMICON), 0);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    wcscpy(g_nid.szTip, L"GoodFon — смена обоев");
+    wcscpy(g_nid.szTip, TW(L"GoodFon — смена обоев", L"GoodFon — wallpaper changer"));
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
 static void show_menu(void)
 {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_UPDATE, L"Сменить обои сейчас");
-    AppendMenuW(m, MF_STRING, IDM_LIKE,   L"Добавить в избранное ♥");
-    AppendMenuW(m, MF_STRING, IDM_UNLIKE, L"Убрать из избранного ♡");
+    AppendMenuW(m, MF_STRING, IDM_UPDATE, TW(L"Сменить обои сейчас", L"Change wallpaper now"));
+    AppendMenuW(m, MF_STRING, IDM_LIKE,   TW(L"Добавить в избранное ♥", L"Add to favorites ♥"));
+    AppendMenuW(m, MF_STRING, IDM_UNLIKE, TW(L"Убрать из избранного ♡", L"Remove from favorites ♡"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
     HMENU mi = CreatePopupMenu();
     for (int i = 0; i < 4; i++) {
-        WCHAR t[32]; _snwprintf(t, 32, L"%d минут", g_intervals[i]);
+        WCHAR t[32]; _snwprintf(t, 32, TW(L"%d минут", L"%d min"), g_intervals[i]);
         UINT fl = MF_STRING | (g_cfg.interval_min == g_intervals[i] ? MF_CHECKED : 0);
         AppendMenuW(mi, fl, IDM_INT_BASE + i, t);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mi, L"Интервал смены");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mi, TW(L"Интервал смены", L"Change interval"));
 
     HMENU ml = CreatePopupMenu();
     for (int i = 0; i < 4; i++) {
-        WCHAR t[48]; _snwprintf(t, 48, L"каждая %d-я", g_like_ns[i]);
+        WCHAR t[48]; _snwprintf(t, 48, TW(L"каждая %d-я", L"every %dth"), g_like_ns[i]);
         UINT fl = MF_STRING | (g_cfg.like_every_n == g_like_ns[i] ? MF_CHECKED : 0);
         AppendMenuW(ml, fl, IDM_LIKEN_BASE + i, t);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)ml, L"Из избранного");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)ml, TW(L"Из избранного", L"From favorites"));
 
     HMENU mr = CreatePopupMenu();
     for (int i = 0; i < RES_COUNT; i++) {
         UINT fl = MF_STRING | (!strcmp(g_cfg.resolution, g_reses[i].value) ? MF_CHECKED : 0);
-        AppendMenuW(mr, fl, IDM_RES_BASE + i, g_reses[i].name);
+        const WCHAR *rn = !strcmp(g_reses[i].value, "original")
+                          ? TW(L"Оригинал (любое)", L"Original (any)") : g_reses[i].name;
+        AppendMenuW(mr, fl, IDM_RES_BASE + i, rn);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mr, L"Разрешение");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mr, TW(L"Разрешение", L"Resolution"));
 
     HMENU mt = CreatePopupMenu();
     int authed = is_authorized();
@@ -2078,29 +2101,41 @@ static void show_menu(void)
         int i = order[k];
         UINT fl = MF_STRING |
             (!_stricmp(g_themes_all[i].slug, g_cfg.theme) ? MF_CHECKED : 0);
-        /* "Эротика" доступна только после авторизации */
-        if (!_stricmp(g_themes_all[i].slug, "erotic") && !authed)
-            fl |= MF_GRAYED;
-        AppendMenuW(mt, fl, IDM_THEME_BASE + i, g_themes_all[i].name);
+        /* "Эротика" доступна только после авторизации — серым, с подсказкой в тексте */
+        if (!_stricmp(g_themes_all[i].slug, "erotic") && !authed) {
+            WCHAR lbl[96];
+            _snwprintf(lbl, 96, L"%s  %s", theme_name(i),
+                       TW(L"— нужен вход", L"— sign in required"));
+            AppendMenuW(mt, MF_STRING | MF_GRAYED, IDM_THEME_BASE + i, lbl);
+        } else
+            AppendMenuW(mt, fl, IDM_THEME_BASE + i, theme_name(i));
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mt, L"Тема");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mt, TW(L"Тема", L"Theme"));
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     HMENU macc = CreatePopupMenu();
-    if (!is_authorized())
-        AppendMenuW(macc, MF_STRING, IDM_REGISTER, L"Регистрация на сайте…");
-    AppendMenuW(macc, MF_STRING, IDM_SETCREDS, L"Авторизация…");
-    if (is_authorized())
-        AppendMenuW(macc, MF_STRING, IDM_LOGOUT, L"Выйти из аккаунта");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)macc, L"Аккаунт");
-    AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, L"Пауза");
+    if (!authed)
+        AppendMenuW(macc, MF_STRING, IDM_REGISTER, TW(L"Регистрация на сайте…", L"Register on site…"));
+    AppendMenuW(macc, MF_STRING, IDM_SETCREDS, TW(L"Авторизация…", L"Sign in…"));
+    if (authed)
+        AppendMenuW(macc, MF_STRING, IDM_LOGOUT, TW(L"Выйти из аккаунта", L"Sign out"));
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)macc, TW(L"Аккаунт", L"Account"));
+
+    HMENU mlang = CreatePopupMenu();
+    AppendMenuW(mlang, MF_STRING | (g_lang == LANG_RU ? MF_CHECKED : 0),
+                IDM_LANG_RU, L"Русский");
+    AppendMenuW(mlang, MF_STRING | (g_lang == LANG_EN ? MF_CHECKED : 0),
+                IDM_LANG_EN, L"English");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mlang, TW(L"Язык", L"Language"));
+
+    AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, TW(L"Пауза", L"Pause"));
     AppendMenuW(m, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0),
-                IDM_NOTIFY, L"Включить уведомления");
+                IDM_NOTIFY, TW(L"Включить уведомления", L"Enable notifications"));
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
-                IDM_AUTOSTART, L"Автозапуск с Windows");
+                IDM_AUTOSTART, TW(L"Автозапуск с Windows", L"Start with Windows"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"By Mansi / slfl@mail.ru");
-    AppendMenuW(m, MF_STRING, IDM_EXIT, L"Выход");
+    AppendMenuW(m, MF_STRING, IDM_EXIT, TW(L"Выход", L"Exit"));
 
     POINT pt; GetCursorPos(&pt);
     SetForegroundWindow(g_hwnd);
@@ -2128,7 +2163,7 @@ static void select_theme(int idx)
     wcscpy(g_like_dir, wsave);
     PathAppendW(g_like_dir, L"Favorite");
     PathAppendW(g_like_dir, wtheme);
-    LOG_INFO("Активная тема: %s (сменится по таймеру или вручную)", g_cfg.theme);
+    LOG_INFO(T("Активная тема: %s (сменится по таймеру или вручную)", "Active theme: %s (will change on timer or manually)"), g_cfg.theme);
 }
 
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -2154,32 +2189,41 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == IDM_NOTIFY) {
             g_cfg.notify = !g_cfg.notify;
             reg_set_dword(L"notify", g_cfg.notify);
-            LOG_INFO("Уведомления: %s", g_cfg.notify ? "вкл" : "выкл");
+            LOG_INFO(T("Уведомления: %s", "Notifications: %s"), g_cfg.notify ? T("вкл", "on") : T("выкл", "off"));
         }
         else if (id == IDM_AUTOSTART) autostart_toggle();
+        else if (id == IDM_LANG_RU || id == IDM_LANG_EN) {
+            g_lang = (id == IDM_LANG_EN) ? LANG_EN : LANG_RU;
+            reg_set_str(L"Language", g_lang == LANG_EN ? "english" : "russian");
+            wcscpy(g_nid.szTip, TW(L"GoodFon — смена обоев", L"GoodFon — wallpaper changer"));
+            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            LOG_INFO(T("Язык интерфейса: русский", "Interface language: English"));
+            notify_user(APP_NAME, TW(L"Язык переключён на русский",
+                                     L"Language switched to English"));
+        }
         else if (id == IDM_EXIT) DestroyWindow(h);
         else if (id >= IDM_INT_BASE && id < IDM_INT_BASE + 4) {
             g_cfg.interval_min = g_intervals[id - IDM_INT_BASE];
             reg_set_dword(L"interval_min", g_cfg.interval_min);
             apply_interval();
-            LOG_INFO("Интервал смены: %d мин", g_cfg.interval_min);
+            LOG_INFO(T("Интервал смены: %d мин", "Change interval: %d min"), g_cfg.interval_min);
         }
         else if (id >= IDM_LIKEN_BASE && id < IDM_LIKEN_BASE + 4) {
             g_cfg.like_every_n = g_like_ns[id - IDM_LIKEN_BASE];
             reg_set_dword(L"like_every_n", g_cfg.like_every_n);
-            LOG_INFO("Из избранного: каждая %d-я картинка", g_cfg.like_every_n);
+            LOG_INFO(T("Из избранного: каждая %d-я картинка", "From favorites: every %d-th image"), g_cfg.like_every_n);
         }
         else if (id >= IDM_RES_BASE && id < IDM_RES_BASE + RES_COUNT) {
             strncpy(g_cfg.resolution, g_reses[id - IDM_RES_BASE].value,
                     sizeof(g_cfg.resolution) - 1);
             reg_set_str(L"resolution", g_cfg.resolution);
-            LOG_INFO("Разрешение: %s (применится при следующей смене)", g_cfg.resolution);
+            LOG_INFO(T("Разрешение: %s (применится при следующей смене)", "Resolution: %s (applies on next change)"), g_cfg.resolution);
         }
         else if (id >= IDM_THEME_BASE && id < IDM_THEME_BASE + THEME_COUNT) {
             int idx = id - IDM_THEME_BASE;
             if (!_stricmp(g_themes_all[idx].slug, "erotic") && !is_authorized()) {
-                LOG_WARN("Раздел \"Эротика\" доступен только после авторизации.");
-                MessageBoxW(NULL, L"Доступно после авторизации.",
+                LOG_WARN(T("Раздел \"Эротика\" доступен только после авторизации.", "Section 'Erotic' is available only after signing in."));
+                MessageBoxW(NULL, TW(L"Доступно после авторизации.", L"Available after sign in."),
                             APP_NAME, MB_ICONINFORMATION | MB_TOPMOST);
             } else
                 select_theme(idx);
@@ -2222,7 +2266,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
     config_paths_init();     /* путь к config.ini нужен только для разовой миграции */
     settings_load();         /* из реестра (с импортом старого config.ini при первом запуске) */
     if (!http_init()) {
-        LOG_ERROR("WinHTTP не инициализирован.");
+        LOG_ERROR(T("WinHTTP не инициализирован.", "WinHTTP not initialized."));
         return 1;
     }
 
