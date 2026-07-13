@@ -25,6 +25,8 @@
 #include <shlwapi.h>
 #include <wincrypt.h>
 #include <dpapi.h>
+#include <uxtheme.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,9 +36,10 @@
 /* ================= Константы ================= */
 
 #define APP_NAME        L"GoodFon"
-#define APP_VERSION     "1.0.0"
+#define APP_VERSION     "2.1"
 #define WM_TRAYICON     (WM_APP + 1)
 #define TIMER_ID        1
+#define UPD_TIMER_ID    2
 
 /* Обновление с GitHub (raw): сравниваем хэш локального exe с удалённым. */
 #define UPDATE_BASE  L"https://github.com/slfl/Random-Scripts/raw/refs/heads/main/GoodFon"
@@ -53,34 +56,72 @@ static int g_lang = LANG_RU;
 static const char  *T (const char *ru, const char *en)  { return g_lang == LANG_EN ? en : ru; }
 static const WCHAR *TW(const WCHAR *ru, const WCHAR *en) { return g_lang == LANG_EN ? en : ru; }
 
+/* ================= Тема оформления окна настроек (светлая/тёмная) ========= */
+enum { THEME_LIGHT = 0, THEME_DARK = 1 };
+static int    g_ui_theme = THEME_LIGHT;
+static HBRUSH g_br_bg  = NULL;   /* фон окна/статики */
+static HBRUSH g_br_ctl = NULL;   /* фон полей ввода/списка */
+static HBRUSH g_br_nav = NULL;   /* фон левой навигации */
+static COLORREF cr_bg (void){ return g_ui_theme ? RGB(32,32,32)  : RGB(243,243,243); }
+static COLORREF cr_nav(void){ return g_ui_theme ? RGB(43,43,43)  : RGB(235,235,235); }
+static COLORREF cr_ctl(void){ return g_ui_theme ? RGB(45,45,45)  : RGB(255,255,255); }
+static COLORREF cr_txt(void){ return g_ui_theme ? RGB(240,240,240): RGB(0,0,0);       }
+static COLORREF cr_sel(void){ return g_ui_theme ? RGB(60,60,60)   : RGB(214,228,247); }
+static COLORREF cr_accent(void){ return RGB(0,120,215); }
+static COLORREF cr_border(void)  { return g_ui_theme ? RGB(82,82,82)  : RGB(205,205,205); }
+static COLORREF cr_btnface(void) { return g_ui_theme ? RGB(55,55,55)  : RGB(251,251,251); }
+static COLORREF cr_btnpress(void){ return g_ui_theme ? RGB(72,72,72)  : RGB(229,229,229); }
+static void theme_brushes_rebuild(void)
+{
+    if (g_br_bg)  DeleteObject(g_br_bg);
+    if (g_br_ctl) DeleteObject(g_br_ctl);
+    if (g_br_nav) DeleteObject(g_br_nav);
+    g_br_bg  = CreateSolidBrush(cr_bg());
+    g_br_ctl = CreateSolidBrush(cr_ctl());
+    g_br_nav = CreateSolidBrush(cr_nav());
+}
+
 
 /* Пункты меню */
 #define IDM_UPDATE      100
 #define IDM_FAVORITE        101
 #define IDM_UNFAVORITE      102
 #define IDM_PAUSE       103
-#define IDM_AUTOSTART   104
 #define IDM_EXIT        105
-#define IDM_SETCREDS    107
-#define IDM_NOTIFY      108
-#define IDM_REGISTER    109
-#define IDM_LOGOUT      110
-#define IDM_LOGIN       111   /* внутреннее действие: асинхронный вход после ввода данных */
-#define IDM_LANG_RU     112
-#define IDM_LANG_EN     113
-#define IDM_CHECKUPDATE 114
-#define IDM_INT_BASE    200   /* интервал смены: 5/10/30/60 мин   */
-#define IDM_FAVN_BASE  220   /* интервал избранного: 5/10/15/20  */
-#define IDM_RES_BASE    240   /* разрешение: HD/FullHD/2K/4K/Ориг */
-#define IDM_THEME_BASE  300   /* темы из встроенной таблицы       */
+#define IDM_LOGIN       111   /* внутреннее действие: асинхронный вход */
+#define IDM_SETTINGS    115   /* открыть окно настроек */
+
+/* Контролы окна настроек */
+#define IDC_NAV         3001
+#define IDC_CB_THEME    3002
+#define IDC_CB_INTERVAL 3003
+#define IDC_CB_RES      3004
+#define IDC_CB_FAVN     3005
+#define IDC_ED_LOGIN    3006
+#define IDC_ED_PASS     3007
+#define IDC_BTN_SIGNIN  3008
+#define IDC_BTN_SIGNOUT 3009
+#define IDC_LNK_REG     3010
+#define IDC_CHK_NOTIFY  3011
+#define IDC_CHK_AUTORUN 3012
+#define IDC_CB_LANG     3013
+#define IDC_CB_APPTHEME 3014
+#define IDC_BTN_UPDATE  3015
+#define IDC_PGTITLE     3016
+#define IDC_BTN_CLOSE   3017
+#define IDC_CB_DOMAIN   3018
+#define IDC_ST_STATUS   3019
+#define IDC_CB_UPDINT   3020
 
 #define MAX_THEMES      64
 #define JAR_SIZE        4096
 #define BODY_LIMIT      (2*1024*1024)   /* максимум HTML в память */
 #define IMG_LIMIT       (64*1024*1024)  /* максимум картинки      */
 
-static const int g_intervals[4] = { 5, 10, 30, 60 };
+static const int g_intervals[8] = { 5, 10, 30, 60, 120, 360, 720, 1440 };
+#define INTERVAL_COUNT 8
 static const int g_favorite_ns[4]   = { 5, 10, 15, 20 };
+#define FAVN_COUNT 4
 
 /* Разрешения для меню: отображаемое имя -> значение в конфиг.
  * "original" — особый режим: берётся любое (самое большое) доступное.  */
@@ -172,6 +213,7 @@ typedef struct {
     int  notify;
     char domain_pref[8];                /* com / ru / auto */
     int  interval_min;
+    int  update_interval_min;           /* автопроверка обновлений: 0=выкл, 60, 1440, 10080 */
     int  counter;
 } Config;
 
@@ -189,6 +231,8 @@ static const char *g_hosts[2] = { "www.goodfon.com", "www.goodfon.ru" };
 
 /* Трей / состояние */
 static HWND  g_hwnd;
+static HWND  g_set_hwnd = NULL;         /* окно настроек (объявлено рано: нужно worker'у) */
+#define WM_APP_LOGINRESULT (WM_APP + 3)
 static HINSTANCE g_hinst;
 static NOTIFYICONDATAW g_nid;
 static volatile LONG g_busy = 0;
@@ -407,11 +451,13 @@ static void settings_write_defaults(void)
     reg_set_str(L"session_ru", "");
     reg_set_dword(L"max_files", 10);
     reg_set_dword(L"favorite_every_n", 10);
+    reg_set_dword(L"update_interval_min", 0);
     reg_set_dword(L"max_attempts", 3);
     reg_set_dword(L"notify", 1);
     reg_set_dword(L"interval_min", 10);
     reg_set_dword(L"counter", 0);
     reg_set_str(L"Language", "russian");
+    reg_set_str(L"AppTheme", "light");
     /* password_enc не пишем — пароль появится, когда его введут через меню */
     LOG_INFO(T("Реестр пуст — созданы значения по умолчанию в HKCU\\Software\\GoodFon", "Registry empty — default values created in HKCU/Software/GoodFon"));
 }
@@ -435,6 +481,9 @@ static int settings_load(void)
       if (reg_get_str(L"Language", lang, sizeof(lang)) && !_stricmp(lang, "english"))
           g_lang = LANG_EN;
       else g_lang = LANG_RU; }
+    { char th[16];
+      g_ui_theme = (reg_get_str(L"AppTheme", th, sizeof(th)) && !_stricmp(th, "dark"))
+                   ? THEME_DARK : THEME_LIGHT; }
 
     if (!reg_get_str(L"resolution", g_cfg.resolution, sizeof(g_cfg.resolution)) || !g_cfg.resolution[0])
         strcpy(g_cfg.resolution, "1920x1080");
@@ -446,6 +495,7 @@ static int settings_load(void)
 
     g_cfg.max_files    = reg_get_dword(L"max_files", 10);
     g_cfg.favorite_every_n = reg_get_dword(L"favorite_every_n", 10);
+    g_cfg.update_interval_min = reg_get_dword(L"update_interval_min", 0);
     g_cfg.max_attempts = reg_get_dword(L"max_attempts", 3);
     g_cfg.notify       = reg_get_dword(L"notify", 1);
     g_cfg.interval_min = reg_get_dword(L"interval_min", 10);
@@ -1422,7 +1472,7 @@ static void do_update(void)
     g_cfg.counter++;
     counter_save();
     LOG_INFO(T("Запуск #%d (из Favorite каждые %d)", "Run #%d (from Favorite every %d)"), g_cfg.counter, g_cfg.favorite_every_n);
-    if (g_cfg.counter >= g_cfg.favorite_every_n) {
+    if (g_cfg.favorite_every_n > 0 && g_cfg.counter >= g_cfg.favorite_every_n) {
         g_cfg.counter = 0; counter_save();
         if (set_wallpaper_from_favorite()) return;
         LOG_INFO(T("Папка Favorite пуста, продолжаем загрузку с сайта", "Favorite folder is empty, continuing download from site"));
@@ -1831,9 +1881,11 @@ static DWORD WINAPI worker_thread(LPVOID param)
             if (ensure_session()) {
                 LOG_INFO(T("Авторизация через меню успешна.", "Sign-in from menu successful."));
                 notify_user(L"GoodFon", TW(L"Авторизация успешна.", L"Authorization successful."));
+                if (g_set_hwnd) PostMessageW(g_set_hwnd, WM_APP_LOGINRESULT, 1, 0);
             } else {
                 LOG_WARN(T("Авторизация через меню не удалась (проверьте логин и пароль).", "Sign-in from menu failed (check login and password)."));
                 notify_user(L"GoodFon", TW(L"Не удалось войти: проверьте логин и пароль.", L"Sign-in failed: check login and password."));
+                if (g_set_hwnd) PostMessageW(g_set_hwnd, WM_APP_LOGINRESULT, 2, 0);
             }
             break;
     }
@@ -1866,52 +1918,6 @@ static DWORD WINAPI startup_thread(LPVOID param)
     return 0;
 }
 
-/* ================= Диалог ввода логина/пароля ================= */
-
-static WCHAR g_dlg_login[128];
-static WCHAR g_dlg_pass[128];
-static int   g_dlg_result;   /* -1 идёт, 0 отмена, 1 сохранено */
-
-static LRESULT CALLBACK CredProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
-{
-    static HWND eLogin, ePass;
-    switch (msg) {
-    case WM_CREATE:
-        CreateWindowW(L"STATIC", TW(L"Логин:", L"Login:"), WS_CHILD | WS_VISIBLE,
-                      12, 14, 70, 20, h, NULL, g_hinst, NULL);
-        eLogin = CreateWindowW(L"EDIT", g_dlg_login,
-                      WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                      90, 12, 190, 24, h, (HMENU)1001, g_hinst, NULL);
-        CreateWindowW(L"STATIC", TW(L"Пароль:", L"Password:"), WS_CHILD | WS_VISIBLE,
-                      12, 48, 70, 20, h, NULL, g_hinst, NULL);
-        ePass = CreateWindowW(L"EDIT", g_dlg_pass,
-                      WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
-                      90, 46, 190, 24, h, (HMENU)1002, g_hinst, NULL);
-        CreateWindowW(L"BUTTON", TW(L"Войти", L"Sign in"),
-                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                      90, 84, 100, 28, h, (HMENU)IDOK, g_hinst, NULL);
-        CreateWindowW(L"BUTTON", TW(L"Отмена", L"Cancel"), WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                      195, 84, 85, 28, h, (HMENU)IDCANCEL, g_hinst, NULL);
-        SetFocus(eLogin);
-        return 0;
-    case WM_COMMAND:
-        if (LOWORD(wp) == IDOK) {
-            GetWindowTextW(eLogin, g_dlg_login, 128);
-            GetWindowTextW(ePass, g_dlg_pass, 128);
-            g_dlg_result = 1;
-            DestroyWindow(h);
-        } else if (LOWORD(wp) == IDCANCEL) {
-            g_dlg_result = 0;
-            DestroyWindow(h);
-        }
-        return 0;
-    case WM_CLOSE:
-        g_dlg_result = 0;
-        DestroyWindow(h);
-        return 0;
-    }
-    return DefWindowProcW(h, msg, wp, lp);
-}
 
 /* Открыть страницу регистрации сайта в браузере (в приложении нельзя из-за
  * reCAPTCHA на форме регистрации). */
@@ -2032,7 +2038,7 @@ static void account_register(void)
     ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
     LOG_INFO(T("Открыта страница регистрации: %s", "Opened registration page: %s"), url8);
     notify_user(L"GoodFon",
-                TW(L"Открыл регистрацию в браузере. После неё войдите через «Авторизация…».", L"Opened registration in the browser. Then sign in via ‘Sign in…’."));
+                TW(L"Открыл регистрацию в браузере. После неё войдите в окне настроек, раздел «Аккаунт».", L"Opened registration in the browser. Then sign in from the Settings window, Account section."));
 }
 
 /* Локальный выход из аккаунта: чистим логин/пароль/сессии. Сайт не трогаем. */
@@ -2059,71 +2065,6 @@ static void account_logout(void)
     notify_user(L"GoodFon", TW(L"Выход из аккаунта выполнен.", L"Signed out."));
 }
 
-static void prompt_credentials(void)
-{
-    static int registered = 0;
-    const WCHAR *cls = L"GoodFonCredWnd";
-    if (!registered) {
-        WNDCLASSW wc = {0};
-        wc.lpfnWndProc = CredProc;
-        wc.hInstance = g_hinst;
-        wc.lpszClassName = cls;
-        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.hIcon = LoadIconW(g_hinst, MAKEINTRESOURCEW(IDI_APPICON));
-        RegisterClassW(&wc);
-        registered = 1;
-    }
-
-    /* префилл АКТУАЛЬНЫМИ значениями из реестра (пароль расшифровывается DPAPI) */
-    char lf[128] = "", pf[128] = "";
-    reg_get_str(L"login", lf, sizeof(lf));
-    reg_get_password(pf, sizeof(pf));
-    strncpy(g_cfg.login, lf, sizeof(g_cfg.login) - 1);
-    strncpy(g_cfg.password, pf, sizeof(g_cfg.password) - 1);
-    utf8_to_wide(lf, g_dlg_login, 128);
-    utf8_to_wide(pf, g_dlg_pass, 128);
-    g_dlg_result = -1;
-
-    int w = 300, ht = 155;
-    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int x = wa.left + ((wa.right - wa.left) - w) / 2;
-    int y = wa.top + ((wa.bottom - wa.top) - ht) / 2;
-
-    HWND dh = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, cls,
-                              TW(L"GoodFon — логин и пароль", L"GoodFon — login and password"),
-                              WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                              x, y, w, ht, g_hwnd, NULL, g_hinst, NULL);
-    if (!dh) return;
-    ShowWindow(dh, SW_SHOW);
-    SetForegroundWindow(dh);
-
-    /* локальный модальный цикл (без PostQuitMessage, чтобы не убить главный) */
-    MSG m;
-    while (IsWindow(dh) && GetMessageW(&m, NULL, 0, 0) > 0) {
-        if (!IsDialogMessageW(dh, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
-    }
-
-    if (g_dlg_result == 1) {
-        char l8[256], p8[256];
-        wide_to_utf8(g_dlg_login, l8, sizeof(l8));
-        wide_to_utf8(g_dlg_pass, p8, sizeof(p8));
-        strncpy(g_cfg.login, l8, sizeof(g_cfg.login) - 1);
-        strncpy(g_cfg.password, p8, sizeof(g_cfg.password) - 1);
-        reg_set_str(L"login", g_cfg.login);
-        reg_set_password(g_cfg.password);
-        /* смена логина делает старый кэш недействительным — чистим и логинимся заново */
-        g_jar_com[0] = 0; g_jar_ru[0] = 0;
-        reg_set_str(L"session_com", "");
-        reg_set_str(L"session_ru", "");
-        LOG_INFO(T("Логин/пароль сохранены, выполняю вход…", "Login/password saved, signing in…"));
-        run_async(IDM_LOGIN);   /* сразу авторизуемся и тянем сессию/куки */
-    }
-}
-
 /* ================= Трей и меню ================= */
 
 static void tray_add(void)
@@ -2143,94 +2084,655 @@ static void tray_add(void)
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
-static void show_menu(void)
+/* ============================ Окно настроек ============================ */
+static void apply_interval(void);      /* fwd */
+static void apply_update_interval(void); /* fwd */
+static void open_settings(void);       /* fwd */
+
+static int   g_set_page = 0;
+static int   g_login_status = 0;   /* 0 нет, 1 успех, 2 ошибка — статус входа в окне */
+static HFONT g_set_font = NULL, g_set_font_title = NULL, g_set_font_icon = NULL;
+
+/* Подкласс комбобокса: в тёмной теме полностью рисуем его сами (фон, рамка,
+ * текст выбранного пункта, стрелка) — чтобы не было белой рамки/кнопки. */
+static LRESULT CALLBACK ComboSubProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_UPDATE, TW(L"Сменить обои сейчас", L"Change wallpaper now"));
-    AppendMenuW(m, MF_STRING, IDM_FAVORITE,   TW(L"Добавить в избранное ♥", L"Add to favorites ♥"));
-    AppendMenuW(m, MF_STRING, IDM_UNFAVORITE, TW(L"Убрать из избранного ♡", L"Remove from favorites ♡"));
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    WNDPROC old = (WNDPROC)GetPropW(h, L"gf_old");
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        int bw = GetSystemMetrics(SM_CXVSCROLL) + 4;
 
-    HMENU mi = CreatePopupMenu();
-    for (int i = 0; i < 4; i++) {
-        WCHAR t[32]; _snwprintf(t, 32, TW(L"%d минут", L"%d min"), g_intervals[i]);
-        UINT fl = MF_STRING | (g_cfg.interval_min == g_intervals[i] ? MF_CHECKED : 0);
-        AppendMenuW(mi, fl, IDM_INT_BASE + i, t);
+        FillRect(dc, &rc, g_br_bg);   /* фон окна — чтобы углы скругления слились */
+
+        HBRUSH bg = CreateSolidBrush(cr_ctl());
+        HPEN   pen = CreatePen(PS_SOLID, 1, cr_border());
+        HGDIOBJ ob = SelectObject(dc, bg), op = SelectObject(dc, pen);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+        SelectObject(dc, ob); SelectObject(dc, op);
+        DeleteObject(bg); DeleteObject(pen);
+
+        int sel = (int)SendMessageW(h, CB_GETCURSEL, 0, 0);
+        if (sel >= 0) {
+            WCHAR t[160]; SendMessageW(h, CB_GETLBTEXT, sel, (LPARAM)t);
+            HFONT f = (HFONT)SendMessageW(h, WM_GETFONT, 0, 0);
+            HGDIOBJ of = SelectObject(dc, f);
+            SetBkMode(dc, TRANSPARENT); SetTextColor(dc, cr_txt());
+            RECT tr = rc; tr.left += 10; tr.right -= bw;
+            DrawTextW(dc, t, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(dc, of);
+        }
+        /* стрелка */
+        int cx = rc.right - bw / 2 - 2, cy = (rc.top + rc.bottom) / 2;
+        POINT p[3] = { { cx - 4, cy - 2 }, { cx + 4, cy - 2 }, { cx, cy + 3 } };
+        HBRUSH ab = CreateSolidBrush(cr_txt());
+        HPEN   ap = CreatePen(PS_SOLID, 1, cr_txt());
+        HGDIOBJ ob2 = SelectObject(dc, ab), op2 = SelectObject(dc, ap);
+        Polygon(dc, p, 3);
+        SelectObject(dc, ob2); SelectObject(dc, op2);
+        DeleteObject(ab); DeleteObject(ap);
+
+        EndPaint(h, &ps);
+        return 0;
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mi, TW(L"Интервал смены", L"Change interval"));
-
-    HMENU ml = CreatePopupMenu();
-    for (int i = 0; i < 4; i++) {
-        WCHAR t[48]; _snwprintf(t, 48, TW(L"каждая %d-я", L"every %dth"), g_favorite_ns[i]);
-        UINT fl = MF_STRING | (g_cfg.favorite_every_n == g_favorite_ns[i] ? MF_CHECKED : 0);
-        AppendMenuW(ml, fl, IDM_FAVN_BASE + i, t);
+    if (msg == WM_NCDESTROY) {
+        WNDPROC o = old;
+        RemovePropW(h, L"gf_old");
+        return CallWindowProcW(o, h, msg, wp, lp);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)ml, TW(L"Из избранного", L"From favorites"));
+    return CallWindowProcW(old, h, msg, wp, lp);
+}
+static void combo_subclass(HWND cb)
+{
+    WNDPROC old = (WNDPROC)SetWindowLongPtrW(cb, GWLP_WNDPROC, (LONG_PTR)ComboSubProc);
+    SetPropW(cb, L"gf_old", (HANDLE)old);
+}
+static BOOL CALLBACK subclass_combos_cb(HWND c, LPARAM lp)
+{
+    (void)lp; WCHAR cls[16]; GetClassNameW(c, cls, 16);
+    if (!lstrcmpiW(cls, L"COMBOBOX")) combo_subclass(c);
+    return TRUE;
+}
 
-    HMENU mr = CreatePopupMenu();
+static void set_titlebar_dark(HWND h, int dark)
+{
+    BOOL v = dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(h, 20, &v, sizeof(v));   /* DWMWA_USE_IMMERSIVE_DARK_MODE (2004+) */
+    DwmSetWindowAttribute(h, 19, &v, sizeof(v));   /* старое значение (1809/1903)           */
+}
+
+/* Включить тёмный режим на уровне приложения (недокументированный uxtheme, ordinal 135).
+ * Нужен, чтобы комбобоксы/кнопки/скроллбары рисовались тёмными. Мягко деградирует. */
+static void enable_dark_mode_app(int dark)
+{
+    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    typedef int  (WINAPI *SetPreferredAppMode_t)(int);
+    typedef void (WINAPI *FlushMenuThemes_t)(void);
+    SetPreferredAppMode_t setmode = (SetPreferredAppMode_t)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+    FlushMenuThemes_t     flush   = (FlushMenuThemes_t)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+    if (setmode) setmode(dark ? 2 /*ForceDark*/ : 3 /*ForceLight*/);
+    if (flush)   flush();
+    FreeLibrary(ux);
+}
+
+static BOOL CALLBACK theme_ctl_cb(HWND c, LPARAM lp)
+{
+    WCHAR cls[32]; GetClassNameW(c, cls, 32);
+    int dark = (int)lp;
+    if (!lstrcmpiW(cls, L"COMBOBOX") || !lstrcmpiW(cls, L"EDIT"))
+        SetWindowTheme(c, dark ? L"DarkMode_CFD" : NULL, NULL);
+    else
+        SetWindowTheme(c, dark ? L"DarkMode_Explorer" : NULL, NULL);
+    return TRUE;
+}
+
+static void settings_apply_theme(HWND dlg)
+{
+    theme_brushes_rebuild();
+    enable_dark_mode_app(g_ui_theme);
+    set_titlebar_dark(dlg, g_ui_theme);
+    EnumChildWindows(dlg, theme_ctl_cb, (LPARAM)g_ui_theme);
+    InvalidateRect(dlg, NULL, TRUE);
+}
+
+/* Показать контролы только текущей страницы (GWLP_USERDATA: -1 = всегда видим). */
+static BOOL CALLBACK show_page_cb(HWND c, LPARAM lp)
+{
+    LONG_PTR pg = GetWindowLongPtrW(c, GWLP_USERDATA);
+    ShowWindow(c, (pg == (LONG_PTR)-1 || pg == (LONG_PTR)lp) ? SW_SHOW : SW_HIDE);
+    return TRUE;
+}
+
+static void settings_set_page(HWND dlg, int page)
+{
+    g_set_page = page;
+    EnumChildWindows(dlg, show_page_cb, (LPARAM)page);
+    const WCHAR *titles[4] = {
+        TW(L"Настройки картинок", L"Image settings"),
+        TW(L"Аккаунт",            L"Account"),
+        TW(L"Дополнительно",      L"Additional"),
+        TW(L"О приложении",       L"About"),
+    };
+    SetDlgItemTextW(dlg, IDC_PGTITLE, titles[page]);
+    if (page == 1) {
+        int a = is_authorized();
+        ShowWindow(GetDlgItem(dlg, IDC_BTN_SIGNOUT), a ? SW_SHOW : SW_HIDE);
+    }
+    InvalidateRect(dlg, NULL, TRUE);
+}
+
+static HWND mk(HWND p, const WCHAR *cls, const WCHAR *txt, DWORD st,
+               int x, int y, int w, int h, int id, int page)
+{
+    HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | st, x, y, w, h,
+                             p, (HMENU)(INT_PTR)id, g_hinst, NULL);
+    SendMessageW(c, WM_SETFONT, (WPARAM)g_set_font, TRUE);
+    SetWindowLongPtrW(c, GWLP_USERDATA, (LONG_PTR)page);
+    return c;
+}
+static void cb_add(HWND cb, const WCHAR *t, INT_PTR data)
+{
+    int i = (int)SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)t);
+    SendMessageW(cb, CB_SETITEMDATA, i, (LPARAM)data);
+}
+
+static void settings_relaunch(void)   /* пересоздать окно (для смены языка/темы) */
+{
+    int pg = g_set_page;
+    HWND o = g_set_hwnd; g_set_hwnd = NULL;
+    if (o) DestroyWindow(o);
+    open_settings();
+    if (g_set_hwnd) {
+        SendMessageW(GetDlgItem(g_set_hwnd, IDC_NAV), LB_SETCURSEL, pg, 0);
+        settings_set_page(g_set_hwnd, pg);
+    }
+}
+
+static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        if (g_set_page == 1) {
+            int ids[2] = { IDC_ED_LOGIN, IDC_ED_PASS };
+            for (int i = 0; i < 2; i++) {
+                HWND e = GetDlgItem(h, ids[i]);
+                if (!e) continue;
+                RECT r; GetWindowRect(e, &r);
+                POINT tl = { r.left, r.top }, br = { r.right, r.bottom };
+                ScreenToClient(h, &tl); ScreenToClient(h, &br);
+                RECT box = { tl.x - 8, tl.y - 7, br.x + 8, br.y + 1 };
+                HBRUSH bg = CreateSolidBrush(cr_ctl());
+                HPEN pen = CreatePen(PS_SOLID, 1, cr_border());
+                HGDIOBJ ob = SelectObject(dc, bg), op = SelectObject(dc, pen);
+                RoundRect(dc, box.left, box.top, box.right, box.bottom, 10, 10);
+                SelectObject(dc, ob); SelectObject(dc, op);
+                DeleteObject(bg); DeleteObject(pen);
+            }
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wp; RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_br_bg);
+        RECT nav = { 0, 0, 170, rc.bottom };
+        FillRect(dc, &nav, g_br_nav);
+        return 1;
+    }
+    case WM_CTLCOLORLISTBOX:
+        SetTextColor((HDC)wp, cr_txt()); SetBkColor((HDC)wp, cr_nav());
+        return (LRESULT)g_br_nav;
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wp, cr_txt()); SetBkColor((HDC)wp, cr_ctl());
+        return (LRESULT)g_br_ctl;
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        int cid = GetDlgCtrlID((HWND)lp);
+        SetBkMode(dc, TRANSPARENT);
+        if (cid == IDC_ST_STATUS)
+            SetTextColor(dc, g_login_status == 1 ? RGB(40,170,80)
+                           : g_login_status == 2 ? RGB(220,70,70) : cr_txt());
+        else
+            SetTextColor(dc, cid == IDC_LNK_REG ? cr_accent() : cr_txt());
+        SetBkColor(dc, cr_bg());
+        return (LRESULT)g_br_bg;
+    }
+    case WM_CTLCOLORBTN:
+        SetBkMode((HDC)wp, TRANSPARENT);
+        SetTextColor((HDC)wp, cr_txt()); SetBkColor((HDC)wp, cr_bg());
+        return (LRESULT)g_br_bg;
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+        if (d->CtlID == IDC_NAV) {
+            if ((int)d->itemID < 0) return TRUE;
+            int sel = (d->itemState & ODS_SELECTED) != 0;
+            HBRUSH sb = sel ? CreateSolidBrush(cr_sel()) : g_br_nav;
+            FillRect(d->hDC, &d->rcItem, sb);
+            if (sel) {
+                DeleteObject(sb);
+                RECT b = d->rcItem; b.right = b.left + 3;
+                HBRUSH ab = CreateSolidBrush(cr_accent()); FillRect(d->hDC, &b, ab); DeleteObject(ab);
+            }
+            SetBkMode(d->hDC, TRANSPARENT);
+            SetTextColor(d->hDC, cr_txt());
+            /* иконка (Segoe MDL2 Assets): Картинки, Аккаунт, Дополнительно */
+            const WCHAR *icons[4] = { L"\uE8B9", L"\uE77B", L"\uE713", L"\uE946" };
+            if (g_set_font_icon && (int)d->itemID < 4) {
+                HFONT of = (HFONT)SelectObject(d->hDC, g_set_font_icon);
+                RECT ir = d->rcItem; ir.left += 16;
+                DrawTextW(d->hDC, icons[d->itemID], -1, &ir, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(d->hDC, of);
+            }
+            WCHAR t[64]; SendMessageW(d->hwndItem, LB_GETTEXT, d->itemID, (LPARAM)t);
+            RECT tr = d->rcItem; tr.left += 46;
+            DrawTextW(d->hDC, t, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        if (d->CtlType == ODT_BUTTON) {
+            int pressed = (d->itemState & ODS_SELECTED) != 0;
+            int primary = (d->CtlID == IDC_BTN_SIGNIN);
+            COLORREF fill = primary ? (pressed ? RGB(0,90,170) : cr_accent())
+                                    : (pressed ? cr_btnpress() : cr_btnface());
+            COLORREF txt  = primary ? RGB(255,255,255) : cr_txt();
+            COLORREF bord = primary ? fill : cr_border();
+            FillRect(d->hDC, &d->rcItem, g_br_bg);      /* фон под скруглением */
+            HBRUSH hb = CreateSolidBrush(fill);
+            HPEN   hp = CreatePen(PS_SOLID, 1, bord);
+            HGDIOBJ ob = SelectObject(d->hDC, hb), op = SelectObject(d->hDC, hp);
+            RoundRect(d->hDC, d->rcItem.left, d->rcItem.top,
+                      d->rcItem.right, d->rcItem.bottom, 12, 12);
+            SelectObject(d->hDC, ob); SelectObject(d->hDC, op);
+            DeleteObject(hb); DeleteObject(hp);
+            WCHAR t[64]; GetWindowTextW(d->hwndItem, t, 64);
+            SetBkMode(d->hDC, TRANSPARENT);
+            SetTextColor(d->hDC, txt);
+            DrawTextW(d->hDC, t, -1, &d->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        return TRUE;
+    }
+
+    case WM_COMMAND: {
+        int id = LOWORD(wp), code = HIWORD(wp);
+        HWND ctl = (HWND)lp;
+        if (id == IDC_NAV && code == LBN_SELCHANGE) {
+            settings_set_page(h, (int)SendMessageW(ctl, LB_GETCURSEL, 0, 0));
+        }
+        else if (id == IDC_CB_THEME && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            int idx = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
+            if (!_stricmp(g_themes_all[idx].slug, "erotic") && !is_authorized()) {
+                MessageBoxW(h, TW(L"Доступно после авторизации.", L"Available after sign in."),
+                            APP_NAME, MB_ICONINFORMATION);
+                int cnt = (int)SendMessageW(ctl, CB_GETCOUNT, 0, 0);
+                for (int i = 0; i < cnt; i++) {
+                    int di = (int)SendMessageW(ctl, CB_GETITEMDATA, i, 0);
+                    if (!_stricmp(g_themes_all[di].slug, g_cfg.theme)) {
+                        SendMessageW(ctl, CB_SETCURSEL, i, 0); break;
+                    }
+                }
+            } else select_theme(idx);
+        }
+        else if (id == IDC_CB_INTERVAL && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            g_cfg.interval_min = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
+            reg_set_dword(L"interval_min", g_cfg.interval_min);
+            apply_interval();
+        }
+        else if (id == IDC_CB_RES && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            int ri = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
+            strncpy(g_cfg.resolution, g_reses[ri].value, sizeof(g_cfg.resolution) - 1);
+            reg_set_str(L"resolution", g_cfg.resolution);
+        }
+        else if (id == IDC_CB_FAVN && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            g_cfg.favorite_every_n = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
+            reg_set_dword(L"favorite_every_n", g_cfg.favorite_every_n);
+        }
+        else if (id == IDC_BTN_SIGNIN && code == BN_CLICKED) {
+            char lg[128] = {0}, pw[128] = {0}; WCHAR w[128];
+            GetWindowTextW(GetDlgItem(h, IDC_ED_LOGIN), w, 128); wide_to_utf8(w, lg, sizeof(lg));
+            GetWindowTextW(GetDlgItem(h, IDC_ED_PASS),  w, 128); wide_to_utf8(w, pw, sizeof(pw));
+            if (!lg[0] || !pw[0]) {
+                MessageBoxW(h, TW(L"Введите логин и пароль.", L"Enter login and password."),
+                            APP_NAME, MB_ICONINFORMATION);
+            } else {
+                strncpy(g_cfg.login, lg, sizeof(g_cfg.login) - 1);
+                strncpy(g_cfg.password, pw, sizeof(g_cfg.password) - 1);
+                reg_set_str(L"login", g_cfg.login);
+                reg_set_password(g_cfg.password);
+                g_jar_com[0] = 0; g_jar_ru[0] = 0;
+                reg_set_str(L"session_com", ""); reg_set_str(L"session_ru", "");
+                LOG_INFO(T("Логин/пароль сохранены, выполняю вход…", "Login/password saved, signing in…"));
+                g_login_status = 0;
+                SetDlgItemTextW(h, IDC_ST_STATUS, TW(L"Вход…", L"Signing in…"));
+                run_async(IDM_LOGIN);
+                settings_set_page(h, 1);
+            }
+        }
+        else if (id == IDC_BTN_SIGNOUT && code == BN_CLICKED) {
+            account_logout();
+            SetDlgItemTextW(h, IDC_ED_LOGIN, L"");
+            SetDlgItemTextW(h, IDC_ED_PASS,  L"");
+            g_login_status = 0;
+            SetDlgItemTextW(h, IDC_ST_STATUS, L"");
+            settings_set_page(h, 1);
+        }
+        else if (id == IDC_LNK_REG && code == STN_CLICKED) {
+            account_register();
+        }
+        else if (id == IDC_CHK_NOTIFY && code == BN_CLICKED) {
+            g_cfg.notify = (int)SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            reg_set_dword(L"notify", g_cfg.notify);
+        }
+        else if (id == IDC_CHK_AUTORUN && code == BN_CLICKED) {
+            autostart_toggle();
+            SendMessageW(ctl, BM_SETCHECK, autostart_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
+        else if (id == IDC_CB_DOMAIN && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            const char *dv = s == 1 ? "ru" : s == 2 ? "com" : "auto";
+            strncpy(g_cfg.domain_pref, dv, sizeof(g_cfg.domain_pref) - 1);
+            g_cfg.domain_pref[sizeof(g_cfg.domain_pref) - 1] = 0;
+            reg_set_str(L"domain", g_cfg.domain_pref);
+            LOG_INFO(T("Предпочтение домена: %s", "Domain preference: %s"), g_cfg.domain_pref);
+        }
+        else if (id == IDC_CB_UPDINT && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            g_cfg.update_interval_min = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
+            reg_set_dword(L"update_interval_min", g_cfg.update_interval_min);
+            apply_update_interval();
+            LOG_INFO(T("Автопроверка обновлений: %d мин", "Auto-update check: %d min"),
+                     g_cfg.update_interval_min);
+        }
+        else if (id == IDC_CB_LANG && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            g_lang = s == 1 ? LANG_EN : LANG_RU;
+            reg_set_str(L"Language", g_lang == LANG_EN ? "english" : "russian");
+            wcscpy(g_nid.szTip, TW(L"GoodFon — смена обоев", L"GoodFon — wallpaper changer"));
+            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            settings_relaunch();
+        }
+        else if (id == IDC_CB_APPTHEME && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            g_ui_theme = s == 1 ? THEME_DARK : THEME_LIGHT;
+            reg_set_str(L"AppTheme", g_ui_theme == THEME_DARK ? "dark" : "light");
+            settings_relaunch();
+        }
+        else if (id == IDC_BTN_UPDATE && code == BN_CLICKED) {
+            run_update_async(0);
+        }
+        else if (id == IDC_BTN_CLOSE && code == BN_CLICKED) {
+            DestroyWindow(h);
+        }
+        return 0;
+    }
+    case WM_APP_LOGINRESULT: {
+        g_login_status = (int)wp;   /* 1 успех, 2 ошибка */
+        HWND st = GetDlgItem(h, IDC_ST_STATUS);
+        SetWindowTextW(st, g_login_status == 1
+            ? TW(L"Авторизация успешна.", L"Signed in successfully.")
+            : TW(L"Неверный логин или пароль.", L"Wrong login or password."));
+        settings_set_page(h, 1);    /* обновить видимость «Выйти» */
+        InvalidateRect(st, NULL, TRUE);
+        return 0;
+    }
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: g_set_hwnd = NULL; g_login_status = 0; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void open_settings(void)
+{
+    if (g_set_hwnd) { SetForegroundWindow(g_set_hwnd); return; }
+
+    if (!g_set_font) {
+        g_set_font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        g_set_font_title = CreateFontW(-17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                       0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        g_set_font_icon = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                      0, 0, CLEARTYPE_QUALITY, 0, L"Segoe MDL2 Assets");
+    }
+    static int reg = 0;
+    if (!reg) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = SettingsProc;
+        wc.hInstance = g_hinst;
+        wc.lpszClassName = L"GoodFonSettings";
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hIcon = LoadIconW(g_hinst, MAKEINTRESOURCEW(IDI_APPICON));
+        wc.hbrBackground = NULL;
+        RegisterClassW(&wc);
+        reg = 1;
+    }
+    theme_brushes_rebuild();
+
+    int W = 584, H = 348;
+    RECT wr = { 0, 0, W, H };
+    AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - wh) / 2;
+    HWND h = CreateWindowExW(0, L"GoodFonSettings",
+                             TW(L"GoodFon — Настройки", L"GoodFon — Settings"),
+                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+                             sx, sy, ww, wh, NULL, NULL, g_hinst, NULL);
+    if (!h) return;
+    g_set_hwnd = h;
+
+    HWND nav = mk(h, L"LISTBOX", NULL,
+                  LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VISIBLE,
+                  0, 0, 170, H, IDC_NAV, -1);
+    SendMessageW(nav, LB_SETITEMHEIGHT, 0, 38);
+    SendMessageW(nav, LB_ADDSTRING, 0, (LPARAM)TW(L"Картинки", L"Images"));
+    SendMessageW(nav, LB_ADDSTRING, 0, (LPARAM)TW(L"Аккаунт", L"Account"));
+    SendMessageW(nav, LB_ADDSTRING, 0, (LPARAM)TW(L"Дополнительно", L"Additional"));
+    SendMessageW(nav, LB_ADDSTRING, 0, (LPARAM)TW(L"О приложении", L"About"));
+    SendMessageW(nav, LB_SETCURSEL, 0, 0);
+
+    HWND title = mk(h, L"STATIC", L"", SS_LEFT | WS_VISIBLE, 186, 14, 380, 26, IDC_PGTITLE, -1);
+    SendMessageW(title, WM_SETFONT, (WPARAM)g_set_font_title, TRUE);
+
+    const int CX = 186, VX = 306, VW = 250;
+    int y;
+
+    /* ---- страница 0: Картинки ---- */
+    y = 52;
+    mk(h, L"STATIC", TW(L"Тема", L"Theme"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
+    HWND cbTheme = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                      VX, y, VW, 240, IDC_CB_THEME, 0);
+    { int order[THEME_COUNT];
+      for (int i = 0; i < THEME_COUNT; i++) order[i] = i;
+      qsort(order, THEME_COUNT, sizeof(int), theme_cmp);
+      for (int k = 0; k < THEME_COUNT; k++) {
+          int i = order[k];
+          WCHAR lbl[96];
+          if (!_stricmp(g_themes_all[i].slug, "erotic") && !is_authorized())
+              _snwprintf(lbl, 96, L"%s  %s", theme_name(i), TW(L"— нужен вход", L"— sign in required"));
+          else { wcsncpy(lbl, theme_name(i), 95); lbl[95] = 0; }
+          cb_add(cbTheme, lbl, i);
+          if (!_stricmp(g_themes_all[i].slug, g_cfg.theme))
+              SendMessageW(cbTheme, CB_SETCURSEL, k, 0);
+      } }
+
+    y += 40;
+    mk(h, L"STATIC", TW(L"Интервал смены", L"Change interval"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
+    HWND cbInt = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, VX, y, VW, 260, IDC_CB_INTERVAL, 0);
+    for (int i = 0; i < INTERVAL_COUNT; i++) {
+        int v = g_intervals[i]; WCHAR t[32];
+        if (v < 60)          _snwprintf(t, 32, TW(L"%d минут", L"%d min"), v);
+        else if (v == 1440)  wcscpy(t, TW(L"24 часа (сутки)", L"24 hours (day)"));
+        else                 _snwprintf(t, 32, TW(L"%d часа", L"%d hours"), v / 60);
+        cb_add(cbInt, t, v);
+        if (g_cfg.interval_min == v) SendMessageW(cbInt, CB_SETCURSEL, i, 0);
+    }
+
+    y += 40;
+    mk(h, L"STATIC", TW(L"Разрешение", L"Resolution"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
+    HWND cbRes = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 200, IDC_CB_RES, 0);
     for (int i = 0; i < RES_COUNT; i++) {
-        UINT fl = MF_STRING | (!strcmp(g_cfg.resolution, g_reses[i].value) ? MF_CHECKED : 0);
         const WCHAR *rn = !strcmp(g_reses[i].value, "original")
                           ? TW(L"Оригинал (любое)", L"Original (any)") : g_reses[i].name;
-        AppendMenuW(mr, fl, IDM_RES_BASE + i, rn);
+        cb_add(cbRes, rn, i);
+        if (!strcmp(g_cfg.resolution, g_reses[i].value)) SendMessageW(cbRes, CB_SETCURSEL, i, 0);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mr, TW(L"Разрешение", L"Resolution"));
 
-    HMENU mt = CreatePopupMenu();
-    int authed = is_authorized();
-    int order[THEME_COUNT];
-    for (int i = 0; i < THEME_COUNT; i++) order[i] = i;
-    qsort(order, THEME_COUNT, sizeof(int), theme_cmp);
-    for (int k = 0; k < THEME_COUNT; k++) {
-        int i = order[k];
-        UINT fl = MF_STRING |
-            (!_stricmp(g_themes_all[i].slug, g_cfg.theme) ? MF_CHECKED : 0);
-        /* "Эротика" доступна только после авторизации — серым, с подсказкой в тексте */
-        if (!_stricmp(g_themes_all[i].slug, "erotic") && !authed) {
-            WCHAR lbl[96];
-            _snwprintf(lbl, 96, L"%s  %s", theme_name(i),
-                       TW(L"— нужен вход", L"— sign in required"));
-            AppendMenuW(mt, MF_STRING | MF_GRAYED, IDM_THEME_BASE + i, lbl);
-        } else
-            AppendMenuW(mt, fl, IDM_THEME_BASE + i, theme_name(i));
+    y += 40;
+    mk(h, L"STATIC", TW(L"Из избранного", L"From favorites"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
+    HWND cbFav = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 180, IDC_CB_FAVN, 0);
+    cb_add(cbFav, TW(L"Без избранного", L"No favorites"), 0);
+    if (g_cfg.favorite_every_n == 0) SendMessageW(cbFav, CB_SETCURSEL, 0, 0);
+    for (int i = 0; i < FAVN_COUNT; i++) {
+        WCHAR t[48]; _snwprintf(t, 48, TW(L"каждая %d-я", L"every %dth"), g_favorite_ns[i]);
+        cb_add(cbFav, t, g_favorite_ns[i]);
+        if (g_cfg.favorite_every_n == g_favorite_ns[i]) SendMessageW(cbFav, CB_SETCURSEL, i + 1, 0);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mt, TW(L"Тема", L"Theme"));
 
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    HMENU macc = CreatePopupMenu();
-    if (!authed)
-        AppendMenuW(macc, MF_STRING, IDM_REGISTER, TW(L"Регистрация на сайте…", L"Register on site…"));
-    AppendMenuW(macc, MF_STRING, IDM_SETCREDS, TW(L"Авторизация…", L"Sign in…"));
-    if (authed)
-        AppendMenuW(macc, MF_STRING, IDM_LOGOUT, TW(L"Выйти из аккаунта", L"Sign out"));
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)macc, TW(L"Аккаунт", L"Account"));
+    /* ---- страница 1: Аккаунт ---- */
+    WCHAR wlog[128]; utf8_to_wide(g_cfg.login, wlog, 128);
+    WCHAR wpw[128];  utf8_to_wide(g_cfg.password, wpw, 128);
+    int authed0 = is_authorized();
+    const int EH = 20;   /* высота поля (невысокое — EDIT центрирует текст сам) */
+    y = 52;
+    mk(h, L"STATIC", TW(L"Логин", L"Login"), SS_LEFT, CX, y+4, 110, 20, 0, 1);
+    HWND edLog = mk(h, L"EDIT", (g_cfg.login[0] && strcmp(g_cfg.login,"your_login")) ? wlog : L"",
+       WS_TABSTOP | ES_AUTOHSCROLL, VX+8, y+4, VW-16, EH, IDC_ED_LOGIN, 1);
+    y += 40;
+    mk(h, L"STATIC", TW(L"Пароль", L"Password"), SS_LEFT, CX, y+4, 110, 20, 0, 1);
+    HWND edPw = mk(h, L"EDIT", authed0 ? wpw : L"",
+       WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, VX+8, y+4, VW-16, EH, IDC_ED_PASS, 1);
+    (void)edLog; (void)edPw;
+    y += 46;
+    mk(h, L"BUTTON", TW(L"Войти", L"Sign in"), WS_TABSTOP | BS_OWNERDRAW, VX, y, 120, 28, IDC_BTN_SIGNIN, 1);
+    mk(h, L"BUTTON", TW(L"Выйти из аккаунта", L"Sign out"), WS_TABSTOP | BS_OWNERDRAW, VX+130, y, 120, 28, IDC_BTN_SIGNOUT, 1);
+    y += 44;
+    mk(h, L"STATIC", TW(L"Регистрация на сайте", L"Register on site"), SS_NOTIFY, VX, y, VW, 20, IDC_LNK_REG, 1);
+    y += 26;
+    mk(h, L"STATIC", L"", SS_LEFT, VX, y, VW, 20, IDC_ST_STATUS, 1);
 
-    /* Подменю "Настройки": пауза, уведомления, автозапуск, обновления, язык */
-    HMENU mset = CreatePopupMenu();
-    AppendMenuW(mset, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, TW(L"Пауза", L"Pause"));
-    AppendMenuW(mset, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0),
-                IDM_NOTIFY, TW(L"Включить уведомления", L"Enable notifications"));
-    AppendMenuW(mset, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
-                IDM_AUTOSTART, TW(L"Автозапуск с Windows", L"Start with Windows"));
-    AppendMenuW(mset, MF_STRING, IDM_CHECKUPDATE, TW(L"Проверить обновления", L"Check for updates"));
+    /* ---- страница 2: Дополнительно ---- */
+    y = 46;
+    mk(h, L"BUTTON", TW(L"Включить уведомления", L"Enable notifications"),
+       WS_TABSTOP | BS_AUTOCHECKBOX, CX, y, 360, 22, IDC_CHK_NOTIFY, 2);
+    y += 28;
+    mk(h, L"BUTTON", TW(L"Автозапуск с Windows", L"Start with Windows"),
+       WS_TABSTOP | BS_AUTOCHECKBOX, CX, y, 360, 22, IDC_CHK_AUTORUN, 2);
+    y += 34;
+    mk(h, L"STATIC", TW(L"Домен сайта", L"Site domain"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
+    HWND cbDom = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 120, IDC_CB_DOMAIN, 2);
+    cb_add(cbDom, TW(L"Авто", L"Auto"), 0);
+    cb_add(cbDom, L".ru", 1);
+    cb_add(cbDom, L".com", 2);
+    SendMessageW(cbDom, CB_SETCURSEL,
+                 !strcmp(g_cfg.domain_pref, "ru") ? 1 : !strcmp(g_cfg.domain_pref, "com") ? 2 : 0, 0);
+    y += 34;
+    mk(h, L"STATIC", TW(L"Язык", L"Language"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
+    HWND cbLang = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 120, IDC_CB_LANG, 2);
+    cb_add(cbLang, L"Русский", 0); cb_add(cbLang, L"English", 1);
+    SendMessageW(cbLang, CB_SETCURSEL, g_lang == LANG_EN ? 1 : 0, 0);
+    y += 34;
+    mk(h, L"STATIC", TW(L"Оформление", L"Appearance"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
+    HWND cbTh = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 120, IDC_CB_APPTHEME, 2);
+    cb_add(cbTh, TW(L"Светлая", L"Light"), 0); cb_add(cbTh, TW(L"Тёмная", L"Dark"), 1);
+    SendMessageW(cbTh, CB_SETCURSEL, g_ui_theme == THEME_DARK ? 1 : 0, 0);
+    y += 34;
+    mk(h, L"STATIC", TW(L"Автопроверка", L"Auto-update"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
+    HWND cbUpd = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 160, IDC_CB_UPDINT, 2);
+    cb_add(cbUpd, TW(L"Выключена", L"Off"), 0);
+    cb_add(cbUpd, TW(L"Раз в час", L"Hourly"), 60);
+    cb_add(cbUpd, TW(L"Раз в день", L"Daily"), 1440);
+    cb_add(cbUpd, TW(L"Раз в неделю", L"Weekly"), 10080);
+    { int uv = g_cfg.update_interval_min, si = 0;
+      if (uv == 60) si = 1; else if (uv == 1440) si = 2; else if (uv == 10080) si = 3;
+      SendMessageW(cbUpd, CB_SETCURSEL, si, 0); }
+    y += 36;
+    mk(h, L"BUTTON", TW(L"Проверить обновления", L"Check for updates"),
+       WS_TABSTOP | BS_OWNERDRAW, VX, y, 200, 28, IDC_BTN_UPDATE, 2);
 
-    HMENU mlang = CreatePopupMenu();
-    AppendMenuW(mlang, MF_STRING | (g_lang == LANG_RU ? MF_CHECKED : 0),
-                IDM_LANG_RU, L"Русский");
-    AppendMenuW(mlang, MF_STRING | (g_lang == LANG_EN ? MF_CHECKED : 0),
-                IDM_LANG_EN, L"English");
-    AppendMenuW(mset, MF_POPUP, (UINT_PTR)mlang, TW(L"Язык", L"Language"));
+    SendMessageW(GetDlgItem(h, IDC_CHK_NOTIFY),  BM_SETCHECK, g_cfg.notify ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(GetDlgItem(h, IDC_CHK_AUTORUN), BM_SETCHECK, autostart_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mset, TW(L"Настройки", L"Settings"));
+    /* ---- страница 3: О приложении ---- */
+    mk(h, L"STATIC",
+       TW(L"GoodFon — автоматическая смена обоев рабочего стола.\r\n\r\n"
+          L"Скачивает картинки с goodfon.com / goodfon.ru по выбранной теме и "
+          L"разрешению, умеет добавлять обои в избранное и синхронизировать его "
+          L"с вашим аккаунтом на сайте.",
+          L"GoodFon — automatic desktop wallpaper changer.\r\n\r\n"
+          L"Downloads images from goodfon.com / goodfon.ru by the chosen theme and "
+          L"resolution, can add wallpapers to favorites and sync them with your "
+          L"account on the site."),
+       SS_LEFT, CX, 52, 372, 110, 0, 3);
+    mk(h, L"STATIC", TW(L"Версия 2.1", L"Version 2.1"), SS_LEFT, CX, 224, 372, 20, 0, 3);
+    mk(h, L"STATIC", L"\u00A9 Mansi (slfl) \u00B7 slfl@mail.ru", SS_LEFT, CX, 248, 372, 20, 0, 3);
 
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"By Mansi / slfl@mail.ru");
-    AppendMenuW(m, MF_STRING, IDM_EXIT, TW(L"Выход", L"Exit"));
+    mk(h, L"BUTTON", TW(L"Закрыть", L"Close"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+       464, 300, 100, 28, IDC_BTN_CLOSE, -1);
+
+    EnumChildWindows(h, subclass_combos_cb, 0);
+    g_login_status = 0;
+    settings_apply_theme(h);
+    settings_set_page(h, 0);
+    ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+}
+
+/* ---- Тёмное меню трея (owner-draw). В светлой теме — обычные пункты. ---- */
+typedef struct { const WCHAR *text; int checked; int disabled; int sep; } GfMenuItem;
+static GfMenuItem g_mi[24];
+static int   g_min = 0;
+static HFONT g_menu_font = NULL;
+
+static void menu_add(HMENU m, const WCHAR *txt, UINT id, int checked, int disabled)
+{
+    g_mi[g_min].text = txt; g_mi[g_min].checked = checked;
+    g_mi[g_min].disabled = disabled; g_mi[g_min].sep = 0;
+    AppendMenuW(m, MF_OWNERDRAW | (disabled ? MF_GRAYED : 0), id, (LPCWSTR)&g_mi[g_min]);
+    g_min++;
+}
+static void menu_sep(HMENU m)
+{
+    g_mi[g_min].text = NULL; g_mi[g_min].checked = 0;
+    g_mi[g_min].disabled = 1; g_mi[g_min].sep = 1;
+    AppendMenuW(m, MF_OWNERDRAW | MF_GRAYED, 0xF000 + g_min, (LPCWSTR)&g_mi[g_min]);
+    g_min++;
+}
+
+static void show_menu(void)
+{
+    if (!g_menu_font)
+        g_menu_font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                  0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_min = 0;
+    HMENU m = CreatePopupMenu();
+    menu_add(m, TW(L"Сменить обои сейчас", L"Change wallpaper now"), IDM_UPDATE, 0, 0);
+    menu_add(m, TW(L"Добавить в избранное ♥", L"Add to favorites ♥"), IDM_FAVORITE, 0, 0);
+    menu_add(m, TW(L"Убрать из избранного ♡", L"Remove from favorites ♡"), IDM_UNFAVORITE, 0, 0);
+    menu_sep(m);
+    menu_add(m, TW(L"Пауза", L"Pause"), IDM_PAUSE, g_paused, 0);
+    menu_add(m, TW(L"Настройки", L"Settings"), IDM_SETTINGS, 0, 0);
+    menu_sep(m);
+    menu_add(m, L"By Mansi / slfl@mail.ru", 0, 0, 1);
+    menu_add(m, TW(L"Выход", L"Exit"), IDM_EXIT, 0, 0);
+
+    HBRUSH menubg = CreateSolidBrush(cr_bg());
+    { MENUINFO mif; ZeroMemory(&mif, sizeof(mif));
+      mif.cbSize = sizeof(mif);
+      mif.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+      mif.hbrBack = menubg;
+      SetMenuInfo(m, &mif); }
 
     POINT pt; GetCursorPos(&pt);
     SetForegroundWindow(g_hwnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
     DestroyMenu(m);
+    if (menubg) DeleteObject(menubg);
 }
 
 static void apply_interval(void)
@@ -2238,6 +2740,13 @@ static void apply_interval(void)
     KillTimer(g_hwnd, TIMER_ID);
     if (!g_paused)
         SetTimer(g_hwnd, TIMER_ID, (UINT)g_cfg.interval_min * 60u * 1000u, NULL);
+}
+
+static void apply_update_interval(void)
+{
+    KillTimer(g_hwnd, UPD_TIMER_ID);
+    if (g_cfg.update_interval_min > 0)
+        SetTimer(g_hwnd, UPD_TIMER_ID, (UINT)g_cfg.update_interval_min * 60u * 1000u, NULL);
 }
 
 static void select_theme(int idx)
@@ -2259,6 +2768,53 @@ static void select_theme(int idx)
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_MEASUREITEM: {
+        LPMEASUREITEMSTRUCT mis = (LPMEASUREITEMSTRUCT)lp;
+        if (mis->CtlType == ODT_MENU) {
+            GfMenuItem *it = (GfMenuItem *)mis->itemData;
+            if (it && it->sep) { mis->itemHeight = 8; mis->itemWidth = 10; }
+            else if (it) {
+                HDC dc = GetDC(h); HFONT of = (HFONT)SelectObject(dc, g_menu_font);
+                SIZE sz; GetTextExtentPoint32W(dc, it->text, lstrlenW(it->text), &sz);
+                SelectObject(dc, of); ReleaseDC(h, dc);
+                mis->itemWidth = sz.cx + 44; mis->itemHeight = 26;
+            }
+            return TRUE;
+        }
+        break;
+    }
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+        if (d->CtlType == ODT_MENU) {
+            GfMenuItem *it = (GfMenuItem *)d->itemData;
+            COLORREF bg = (d->itemState & ODS_SELECTED) ? cr_sel() : cr_bg();
+            HBRUSH bb = CreateSolidBrush(bg); FillRect(d->hDC, &d->rcItem, bb); DeleteObject(bb);
+            if (it && it->sep) {
+                HPEN pn = CreatePen(PS_SOLID, 1, cr_border());
+                HGDIOBJ op = SelectObject(d->hDC, pn);
+                int my = (d->rcItem.top + d->rcItem.bottom) / 2;
+                MoveToEx(d->hDC, d->rcItem.left + 8, my, NULL);
+                LineTo(d->hDC, d->rcItem.right - 8, my);
+                SelectObject(d->hDC, op); DeleteObject(pn);
+                return TRUE;
+            }
+            if (it) {
+                HFONT of = (HFONT)SelectObject(d->hDC, g_menu_font);
+                SetBkMode(d->hDC, TRANSPARENT);
+                SetTextColor(d->hDC, it->disabled ? (g_ui_theme ? RGB(140,140,140) : RGB(120,120,120))
+                                                  : cr_txt());
+                if (it->checked) {
+                    RECT ck = d->rcItem; ck.left += 8;
+                    DrawTextW(d->hDC, L"\u2713", -1, &ck, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                }
+                RECT tr = d->rcItem; tr.left += 30;
+                DrawTextW(d->hDC, it->text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(d->hDC, of);
+            }
+            return TRUE;
+        }
+        break;
+    }
     case WM_TRAYICON:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)
             show_menu();
@@ -2267,58 +2823,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TIMER:
         if (wp == TIMER_ID && !g_paused) run_async(IDM_UPDATE);
+        else if (wp == UPD_TIMER_ID) run_update_async(1);   /* тихая автопроверка */
         return 0;
     case WM_COMMAND: {
         int id = LOWORD(wp);
         if (id == IDM_UPDATE || id == IDM_FAVORITE || id == IDM_UNFAVORITE)
             run_async(id);
-        else if (id == IDM_SETCREDS) prompt_credentials();
-        else if (id == IDM_REGISTER) account_register();
-        else if (id == IDM_LOGOUT)   account_logout();
         else if (id == IDM_PAUSE) { g_paused = !g_paused; apply_interval(); }
-        else if (id == IDM_NOTIFY) {
-            g_cfg.notify = !g_cfg.notify;
-            reg_set_dword(L"notify", g_cfg.notify);
-            LOG_INFO(T("Уведомления: %s", "Notifications: %s"), g_cfg.notify ? T("вкл", "on") : T("выкл", "off"));
-        }
-        else if (id == IDM_AUTOSTART) autostart_toggle();
-        else if (id == IDM_CHECKUPDATE) run_update_async(0);
-        else if (id == IDM_LANG_RU || id == IDM_LANG_EN) {
-            g_lang = (id == IDM_LANG_EN) ? LANG_EN : LANG_RU;
-            reg_set_str(L"Language", g_lang == LANG_EN ? "english" : "russian");
-            wcscpy(g_nid.szTip, TW(L"GoodFon — смена обоев", L"GoodFon — wallpaper changer"));
-            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-            LOG_INFO(T("Язык интерфейса: русский", "Interface language: English"));
-            notify_user(APP_NAME, TW(L"Язык переключён на русский",
-                                     L"Language switched to English"));
-        }
+        else if (id == IDM_SETTINGS) open_settings();
         else if (id == IDM_EXIT) DestroyWindow(h);
-        else if (id >= IDM_INT_BASE && id < IDM_INT_BASE + 4) {
-            g_cfg.interval_min = g_intervals[id - IDM_INT_BASE];
-            reg_set_dword(L"interval_min", g_cfg.interval_min);
-            apply_interval();
-            LOG_INFO(T("Интервал смены: %d мин", "Change interval: %d min"), g_cfg.interval_min);
-        }
-        else if (id >= IDM_FAVN_BASE && id < IDM_FAVN_BASE + 4) {
-            g_cfg.favorite_every_n = g_favorite_ns[id - IDM_FAVN_BASE];
-            reg_set_dword(L"favorite_every_n", g_cfg.favorite_every_n);
-            LOG_INFO(T("Из избранного: каждая %d-я картинка", "From favorites: every %d-th image"), g_cfg.favorite_every_n);
-        }
-        else if (id >= IDM_RES_BASE && id < IDM_RES_BASE + RES_COUNT) {
-            strncpy(g_cfg.resolution, g_reses[id - IDM_RES_BASE].value,
-                    sizeof(g_cfg.resolution) - 1);
-            reg_set_str(L"resolution", g_cfg.resolution);
-            LOG_INFO(T("Разрешение: %s (применится при следующей смене)", "Resolution: %s (applies on next change)"), g_cfg.resolution);
-        }
-        else if (id >= IDM_THEME_BASE && id < IDM_THEME_BASE + THEME_COUNT) {
-            int idx = id - IDM_THEME_BASE;
-            if (!_stricmp(g_themes_all[idx].slug, "erotic") && !is_authorized()) {
-                LOG_WARN(T("Раздел \"Эротика\" доступен только после авторизации.", "Section 'Erotic' is available only after signing in."));
-                MessageBoxW(NULL, TW(L"Доступно после авторизации.", L"Available after sign in."),
-                            APP_NAME, MB_ICONINFORMATION | MB_TOPMOST);
-            } else
-                select_theme(idx);
-        }
         return 0;
     }
     case WM_DESTROY:
@@ -2355,6 +2868,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
 
     log_open(debug);         /* без -debug логи не создаются вообще */
     settings_load();         /* из реестра */
+    enable_dark_mode_app(g_ui_theme);   /* тёмный режим приложения по сохранённой теме */
 
     /* Убираем «хвост» прошлого обновления: <exe>.old больше не занят.
      * Старый процесс мог ещё завершаться — делаем несколько попыток. */
@@ -2391,11 +2905,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
                            NULL, NULL, hInst, NULL);
     tray_add();
     apply_interval();
+    apply_update_interval();
     /* синхронизация избранного + первая смена — в фоне, чтобы трей появился сразу */
     { HANDLE h = CreateThread(NULL, 0, startup_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (g_set_hwnd && IsDialogMessageW(g_set_hwnd, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

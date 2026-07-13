@@ -9,7 +9,7 @@ endif()
 add_executable(GoodFon WIN32 main.c resource.rc)
 
 target_link_libraries(GoodFon PRIVATE
-    winhttp shlwapi ole32 shell32 user32 advapi32 gdi32 crypt32)
+    winhttp shlwapi ole32 shell32 user32 advapi32 gdi32 crypt32 uxtheme dwmapi)
 
 target_compile_definitions(GoodFon PRIVATE UNICODE _UNICODE)
 
