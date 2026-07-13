@@ -179,6 +179,7 @@ typedef struct {
 static Config g_cfg;
 static WCHAR  g_config_path[MAX_PATH];
 static WCHAR  g_like_dir[MAX_PATH];
+static WCHAR  g_current_image[MAX_PATH];  /* точный файл, который сейчас на экране */
 
 /* Cookie-джар per-domain (наш собственный, WinHTTP-cookies отключены) */
 static char g_jar_com[JAR_SIZE];
@@ -964,7 +965,11 @@ static int set_wallpaper(const WCHAR *path)
         }
     }
 
-    if (ok) LOG_INFO(T("Обои выставлены: %s", "Wallpaper set: %s"), p8);
+    if (ok) {
+        LOG_INFO(T("Обои выставлены: %s", "Wallpaper set: %s"), p8);
+        wcsncpy(g_current_image, path, MAX_PATH - 1);  /* фиксируем текущую картинку */
+        g_current_image[MAX_PATH - 1] = 0;
+    }
     else    LOG_ERROR(T("Обои НЕ выставлены: %s", "Wallpaper NOT set: %s"), p8);
     return ok;
 }
@@ -1082,17 +1087,6 @@ static int dir_count(const WCHAR *dir)
     FileEnt *f = dir_scan(dir, &n);
     free(f);
     return n;
-}
-
-static WCHAR *last_file_in(const WCHAR *dir, WCHAR *out, int outsz)
-{
-    int n = 0;
-    FileEnt *files = dir_scan(dir, &n);
-    if (!files || n == 0) { free(files); return NULL; }
-    qsort(files, n, sizeof(FileEnt), cmp_mtime);
-    wcsncpy(out, files[n - 1].path, outsz - 1); out[outsz - 1] = 0;
-    free(files);
-    return out;
 }
 
 /* ================= Логика GoodFon ================= */
@@ -1628,20 +1622,29 @@ static void do_like(void)
         notify_user(TW(L"GoodFon: сайт недоступен", L"GoodFon: site unavailable"), TW(L"Операция с избранным невозможна.", L"Favorites operation not possible."));
         return;
     }
-    WCHAR wdir[MAX_PATH]; utf8_to_wide(g_cfg.save_dir, wdir, MAX_PATH);
-    WCHAR last[MAX_PATH];
-    if (!last_file_in(wdir, last, MAX_PATH)) {
-        LOG_ERROR(T("Нет последнего скачанного файла.", "No last downloaded file."));
+    /* Работаем строго по зафиксированной текущей картинке, а не по «свежему
+     * файлу в папке» — иначе можно добавить в избранное совсем другое фото. */
+    WCHAR cur[MAX_PATH];
+    wcsncpy(cur, g_current_image, MAX_PATH - 1); cur[MAX_PATH - 1] = 0;
+    if (!cur[0] || GetFileAttributesW(cur) == INVALID_FILE_ATTRIBUTES) {
+        LOG_ERROR(T("Нет текущей картинки для избранного.", "No current image to favorite."));
+        notify_user(TW(L"GoodFon: ошибка", L"GoodFon: error"),
+                    TW(L"Нет текущей картинки.", L"No current image."));
         return;
     }
+
     SHCreateDirectoryExW(NULL, g_like_dir, NULL);
     WCHAR dest[MAX_PATH];
-    _snwprintf(dest, MAX_PATH, L"%s\\%s", g_like_dir, PathFindFileNameW(last));
-    if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES) {
-        CopyFileW(last, dest, FALSE);
+    /* если картинка уже в папке избранного — не копируем, работаем по ней */
+    if (StrStrIW(cur, g_like_dir) == cur) {
+        wcscpy(dest, cur);
+    } else {
+        _snwprintf(dest, MAX_PATH, L"%s\\%s", g_like_dir, PathFindFileNameW(cur));
+        if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES)
+            CopyFileW(cur, dest, FALSE);
         LOG_INFO(T("Изображение скопировано в папку Favorite/%s", "Image copied to folder Favorite/%s"), g_cfg.theme);
+        set_wallpaper(dest); /* переносим «текущую» на копию из Favorite */
     }
-    set_wallpaper(dest); /* чтобы unlike корректно определил текущую */
 
     char page_url[600];
     page_url_for_file(dest, page_url, sizeof(page_url));
@@ -1659,7 +1662,8 @@ static void do_unlike(void)
         notify_user(TW(L"GoodFon: сайт недоступен", L"GoodFon: site unavailable"), TW(L"Операция с избранным невозможна.", L"Favorites operation not possible."));
         return;
     }
-    WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
+    WCHAR cur[MAX_PATH];
+    wcsncpy(cur, g_current_image, MAX_PATH - 1); cur[MAX_PATH - 1] = 0;
     if (!cur[0] || StrStrIW(cur, g_like_dir) != cur) {
         LOG_ERROR(T("Текущие обои не из папки Favorite — unlike невозможен.", "Current wallpaper is not from the Favorite folder — unlike impossible."));
         notify_user(TW(L"GoodFon: ошибка", L"GoodFon: error"), TW(L"Текущие обои не из папки избранного.", L"Current wallpaper is not from the favorites folder."));
