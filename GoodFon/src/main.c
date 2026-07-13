@@ -38,9 +38,8 @@
 #define WM_TRAYICON     (WM_APP + 1)
 #define TIMER_ID        1
 
-/* Обновление с GitHub (raw). Рядом с exe лежит version.txt с номером версии. */
+/* Обновление с GitHub (raw): сравниваем хэш локального exe с удалённым. */
 #define UPDATE_BASE  L"https://github.com/slfl/Random-Scripts/raw/refs/heads/main/GoodFon"
-#define UPDATE_VER_URL  UPDATE_BASE L"/version.txt"
 #if defined(_WIN64)
 #define UPDATE_EXE_URL  UPDATE_BASE L"/GoodFon-x64.exe"
 #else
@@ -2018,64 +2017,42 @@ static LRESULT CALLBACK CredProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
  * reCAPTCHA на форме регистрации). */
 static void select_theme(int idx);   /* fwd */
 
-/* Сравнение версий вида 1.2.3: <0 если a<b, 0 если ==, >0 если a>b. */
-static int version_cmp(const char *a, const char *b)
+/* Быстрый некриптографический хэш файла (FNV-1a 64) — для сравнения exe. */
+static unsigned long long hash_file(const WCHAR *path)
 {
-    while (*a || *b) {
-        int va = atoi(a), vb = atoi(b);
-        if (va != vb) return va < vb ? -1 : 1;
-        while (*a && *a != '.') a++;
-        if (*a == '.') a++;
-        while (*b && *b != '.') b++;
-        if (*b == '.') b++;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    unsigned long long hsh = 1469598103934665603ULL;
+    unsigned char buf[65536]; DWORD rd = 0;
+    while (ReadFile(h, buf, sizeof(buf), &rd, NULL) && rd) {
+        for (DWORD i = 0; i < rd; i++) { hsh ^= buf[i]; hsh *= 1099511628211ULL; }
     }
-    return 0;
+    CloseHandle(h);
+    return hsh;
 }
 
-/* Проверка и установка обновления. Приём с заменой работающего exe:
- *   1) переименовать себя  ->  <exe>.old  (работающий файл переименовать МОЖНО);
- *   2) положить скачанный апдейт на место <exe>;
- *   3) запустить новый <exe> и выйти. Старый .old удалит новый экземпляр на старте. */
+/* Проверка и установка обновления по ХЭШУ exe: качаем удалённый exe во временный
+ * файл, сравниваем его хэш с текущим. Совпал — уже актуально; разошёлся — ставим.
+ * Замена работающего файла: self -> <exe>.old, апдейт -> self, запуск, выход. */
 static void check_update(int silent)
 {
-    char rv[64] = {0};
-    if (!fetch_url_raw(UPDATE_VER_URL, NULL, rv, sizeof(rv))) {
-        LOG_WARN(T("Проверка обновлений: не удалось получить version.txt",
-                   "Update check: failed to fetch version.txt"));
-        if (!silent) notify_user(APP_NAME,
-            TW(L"Не удалось проверить обновления.", L"Failed to check for updates."));
-        return;
-    }
-    /* обрезаем пробелы/переводы строк */
-    char ver[64]; int j = 0;
-    for (const char *p = rv; *p && j < 63; p++)
-        if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') ver[j++] = *p;
-    ver[j] = 0;
-
-    LOG_INFO(T("Проверка обновлений: локальная %s, на сервере %s",
-               "Update check: local %s, server %s"), APP_VERSION, ver);
-
-    if (ver[0] == 0 || version_cmp(ver, APP_VERSION) <= 0) {
-        if (!silent) notify_user(APP_NAME,
-            TW(L"У вас последняя версия.", L"You have the latest version."));
-        return;
-    }
-
     WCHAR self[MAX_PATH]; GetModuleFileNameW(NULL, self, MAX_PATH);
     WCHAR dir[MAX_PATH];  wcscpy(dir, self); PathRemoveFileSpecW(dir);
     WCHAR upd[MAX_PATH];  PathCombineW(upd, dir, L"GoodFon-update.exe");
 
-    notify_user(APP_NAME, TW(L"Найдено обновление, скачиваю…", L"Update found, downloading…"));
+    if (!silent) notify_user(APP_NAME, TW(L"Проверяю обновления…", L"Checking for updates…"));
+
     if (!fetch_url_raw(UPDATE_EXE_URL, upd, NULL, 0)) {
-        LOG_WARN(T("Обновление: не удалось скачать новый exe.",
-                   "Update: failed to download the new exe."));
+        LOG_WARN(T("Обновление: не удалось скачать exe с GitHub.",
+                   "Update: failed to download exe from GitHub."));
         if (!silent) notify_user(APP_NAME,
-            TW(L"Не удалось скачать обновление.", L"Failed to download the update."));
+            TW(L"Не удалось проверить обновления.", L"Failed to check for updates."));
         DeleteFileW(upd);
         return;
     }
 
-    /* проверка, что скачали реальный exe (MZ) и он не подозрительно мал */
+    /* убедимся, что это настоящий exe (MZ) и не подозрительно мал */
     int valid = 0;
     HANDLE hf = CreateFileW(upd, GENERIC_READ, FILE_SHARE_READ, NULL,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2092,6 +2069,27 @@ static void check_update(int silent)
         if (!silent) notify_user(APP_NAME,
             TW(L"Файл обновления повреждён.", L"Update file is corrupted."));
         DeleteFileW(upd);
+        return;
+    }
+
+    unsigned long long h_self = hash_file(self);
+    unsigned long long h_new  = hash_file(upd);
+    LOG_INFO(T("Проверка обновлений: хэш текущего %08lX%08lX, нового %08lX%08lX",
+               "Update check: current hash %08lX%08lX, new %08lX%08lX"),
+             (unsigned long)(h_self >> 32), (unsigned long)h_self,
+             (unsigned long)(h_new  >> 32), (unsigned long)h_new);
+
+    if (h_new == 0) {   /* не смогли прочитать скачанный файл */
+        if (!silent) notify_user(APP_NAME,
+            TW(L"Не удалось проверить обновления.", L"Failed to check for updates."));
+        DeleteFileW(upd);
+        return;
+    }
+    if (h_self == h_new) {          /* байт-в-байт совпадает — обновлять нечего */
+        DeleteFileW(upd);
+        LOG_INFO(T("Обновлений нет: версия совпадает.", "No updates: version matches."));
+        if (!silent) notify_user(APP_NAME,
+            TW(L"У вас последняя версия.", L"You have the latest version."));
         return;
     }
 
