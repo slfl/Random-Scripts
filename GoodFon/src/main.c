@@ -34,8 +34,18 @@
 /* ================= Константы ================= */
 
 #define APP_NAME        L"GoodFon"
+#define APP_VERSION     "1.0.0"
 #define WM_TRAYICON     (WM_APP + 1)
 #define TIMER_ID        1
+
+/* Обновление с GitHub (raw). Рядом с exe лежит version.txt с номером версии. */
+#define UPDATE_BASE  L"https://github.com/slfl/Random-Scripts/raw/refs/heads/main/GoodFon"
+#define UPDATE_VER_URL  UPDATE_BASE L"/version.txt"
+#if defined(_WIN64)
+#define UPDATE_EXE_URL  UPDATE_BASE L"/GoodFon-x64.exe"
+#else
+#define UPDATE_EXE_URL  UPDATE_BASE L"/GoodFon-x86.exe"
+#endif
 
 /* ================= Язык интерфейса и логов ================= */
 enum { LANG_RU = 0, LANG_EN = 1 };
@@ -59,6 +69,7 @@ static const WCHAR *TW(const WCHAR *ru, const WCHAR *en) { return g_lang == LANG
 #define IDM_LOGIN       111   /* внутреннее действие: асинхронный вход после ввода данных */
 #define IDM_LANG_RU     112
 #define IDM_LANG_EN     113
+#define IDM_CHECKUPDATE 114
 #define IDM_INT_BASE    200   /* интервал смены: 5/10/30/60 мин   */
 #define IDM_LIKEN_BASE  220   /* интервал избранного: 5/10/15/20  */
 #define IDM_RES_BASE    240   /* разрешение: HD/FullHD/2K/4K/Ориг */
@@ -780,7 +791,70 @@ static int http_request(const char *method, const char *url,
     return ok;
 }
 
-/* ================= Обои: IActiveDesktop (плавная смена) ================= */
+/* ================= Загрузчик произвольного URL (для обновлений) =================
+ * Простой GET по полному URL с автоследованием за редиректами (WinHTTP делает это
+ * сам для https->https, что и нужно для github.com -> raw.githubusercontent.com).
+ * Если outfile != NULL — тело пишется в файл; иначе в текстовый буфер txt.      */
+static int fetch_url_raw(const WCHAR *wurl, const WCHAR *outfile, char *txt, int txtcap)
+{
+    URL_COMPONENTS uc; memset(&uc, 0, sizeof(uc));
+    WCHAR host[256], path[1024];
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = host;  uc.dwHostNameLength = 256;
+    uc.lpszUrlPath  = path;  uc.dwUrlPathLength  = 1024;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return 0;
+    int https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+
+    HINTERNET hc = WinHttpConnect(g_hsession, host, uc.nPort, 0);
+    if (!hc) return 0;
+    HINTERNET hr = WinHttpOpenRequest(hc, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                      https ? WINHTTP_FLAG_SECURE : 0);
+    if (!hr) { WinHttpCloseHandle(hc); return 0; }
+    WinHttpSetTimeouts(hr, 8000, 8000, 15000, 60000);
+
+    int ok = 0;
+    if (WinHttpSendRequest(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hr, NULL)) {
+        DWORD status = 0, slen = sizeof(status);
+        WinHttpQueryHeaders(hr, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            NULL, &status, &slen, NULL);
+        if (status == 200) {
+            HANDLE hf = INVALID_HANDLE_VALUE;
+            if (outfile) {
+                hf = CreateFileW(outfile, GENERIC_WRITE, 0, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hf == INVALID_HANDLE_VALUE) {
+                    WinHttpCloseHandle(hr); WinHttpCloseHandle(hc); return 0;
+                }
+            }
+            int tlen = 0;
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(hr, &avail) || !avail) break;
+                char buf[16384];
+                if (avail > sizeof(buf)) avail = sizeof(buf);
+                DWORD rd = 0;
+                if (!WinHttpReadData(hr, buf, avail, &rd) || !rd) break;
+                if (outfile) { DWORD wr; WriteFile(hf, buf, rd, &wr, NULL); }
+                else if (txt) {
+                    int cp = (int)rd;
+                    if (tlen + cp > txtcap - 1) cp = txtcap - 1 - tlen;
+                    if (cp > 0) { memcpy(txt + tlen, buf, cp); tlen += cp; }
+                }
+            }
+            if (outfile) CloseHandle(hf);
+            else if (txt) txt[tlen] = 0;
+            ok = 1;
+        }
+    }
+    WinHttpCloseHandle(hr);
+    WinHttpCloseHandle(hc);
+    return ok;
+}
+
+
 /* wininet.h (где объявлен IActiveDesktop) конфликтует с winhttp.h,
  * поэтому объявляем минимальный интерфейс сами — порядок методов vtbl
  * соответствует официальному IActiveDesktop.                            */
@@ -1940,6 +2014,114 @@ static LRESULT CALLBACK CredProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
  * reCAPTCHA на форме регистрации). */
 static void select_theme(int idx);   /* fwd */
 
+/* Сравнение версий вида 1.2.3: <0 если a<b, 0 если ==, >0 если a>b. */
+static int version_cmp(const char *a, const char *b)
+{
+    while (*a || *b) {
+        int va = atoi(a), vb = atoi(b);
+        if (va != vb) return va < vb ? -1 : 1;
+        while (*a && *a != '.') a++;
+        if (*a == '.') a++;
+        while (*b && *b != '.') b++;
+        if (*b == '.') b++;
+    }
+    return 0;
+}
+
+/* Проверка и установка обновления. Приём с заменой работающего exe:
+ *   1) переименовать себя  ->  <exe>.old  (работающий файл переименовать МОЖНО);
+ *   2) положить скачанный апдейт на место <exe>;
+ *   3) запустить новый <exe> и выйти. Старый .old удалит новый экземпляр на старте. */
+static void check_update(int silent)
+{
+    char rv[64] = {0};
+    if (!fetch_url_raw(UPDATE_VER_URL, NULL, rv, sizeof(rv))) {
+        LOG_WARN(T("Проверка обновлений: не удалось получить version.txt",
+                   "Update check: failed to fetch version.txt"));
+        if (!silent) notify_user(APP_NAME,
+            TW(L"Не удалось проверить обновления.", L"Failed to check for updates."));
+        return;
+    }
+    /* обрезаем пробелы/переводы строк */
+    char ver[64]; int j = 0;
+    for (const char *p = rv; *p && j < 63; p++)
+        if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') ver[j++] = *p;
+    ver[j] = 0;
+
+    LOG_INFO(T("Проверка обновлений: локальная %s, на сервере %s",
+               "Update check: local %s, server %s"), APP_VERSION, ver);
+
+    if (ver[0] == 0 || version_cmp(ver, APP_VERSION) <= 0) {
+        if (!silent) notify_user(APP_NAME,
+            TW(L"У вас последняя версия.", L"You have the latest version."));
+        return;
+    }
+
+    WCHAR self[MAX_PATH]; GetModuleFileNameW(NULL, self, MAX_PATH);
+    WCHAR dir[MAX_PATH];  wcscpy(dir, self); PathRemoveFileSpecW(dir);
+    WCHAR upd[MAX_PATH];  PathCombineW(upd, dir, L"GoodFon-update.exe");
+
+    notify_user(APP_NAME, TW(L"Найдено обновление, скачиваю…", L"Update found, downloading…"));
+    if (!fetch_url_raw(UPDATE_EXE_URL, upd, NULL, 0)) {
+        LOG_WARN(T("Обновление: не удалось скачать новый exe.",
+                   "Update: failed to download the new exe."));
+        if (!silent) notify_user(APP_NAME,
+            TW(L"Не удалось скачать обновление.", L"Failed to download the update."));
+        DeleteFileW(upd);
+        return;
+    }
+
+    /* проверка, что скачали реальный exe (MZ) и он не подозрительно мал */
+    int valid = 0;
+    HANDLE hf = CreateFileW(upd, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf != INVALID_HANDLE_VALUE) {
+        char mz[2] = {0}; DWORD rd = 0;
+        LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(hf, &sz);
+        ReadFile(hf, mz, 2, &rd, NULL);
+        CloseHandle(hf);
+        if (rd == 2 && mz[0] == 'M' && mz[1] == 'Z' && sz.QuadPart > 50000) valid = 1;
+    }
+    if (!valid) {
+        LOG_WARN(T("Обновление: скачанный файл не похож на exe, отмена.",
+                   "Update: downloaded file is not a valid exe, aborting."));
+        if (!silent) notify_user(APP_NAME,
+            TW(L"Файл обновления повреждён.", L"Update file is corrupted."));
+        DeleteFileW(upd);
+        return;
+    }
+
+    WCHAR old[MAX_PATH]; _snwprintf(old, MAX_PATH, L"%s.old", self);
+    DeleteFileW(old);
+    if (!MoveFileExW(self, old, MOVEFILE_REPLACE_EXISTING)) {
+        LOG_ERROR(T("Обновление: не удалось переименовать текущий exe.",
+                    "Update: failed to rename the current exe."));
+        DeleteFileW(upd);
+        return;
+    }
+    if (!MoveFileExW(upd, self, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old, self, MOVEFILE_REPLACE_EXISTING);   /* откат */
+        LOG_ERROR(T("Обновление: не удалось поставить новый exe, откат.",
+                    "Update: failed to install the new exe, rolled back."));
+        return;
+    }
+
+    LOG_INFO(T("Обновление установлено, перезапуск.", "Update installed, restarting."));
+    notify_user(APP_NAME, TW(L"Обновление установлено, перезапуск…",
+                             L"Update installed, restarting…"));
+    ShellExecuteW(NULL, L"open", self, NULL, dir, SW_SHOWNORMAL);
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    ExitProcess(0);
+}
+
+/* Запуск проверки обновлений в отдельном потоке (не блокирует трей и не мешает g_busy). */
+static DWORD WINAPI update_thread(LPVOID p) { check_update((int)(INT_PTR)p); return 0; }
+static void run_update_async(int silent)
+{
+    HANDLE t = CreateThread(NULL, 0, update_thread, (LPVOID)(INT_PTR)silent, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
 static void account_register(void)
 {
     char base[64]; base_url(base, sizeof(base));
@@ -2133,6 +2315,7 @@ static void show_menu(void)
                 IDM_NOTIFY, TW(L"Включить уведомления", L"Enable notifications"));
     AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
                 IDM_AUTOSTART, TW(L"Автозапуск с Windows", L"Start with Windows"));
+    AppendMenuW(m, MF_STRING, IDM_CHECKUPDATE, TW(L"Проверить обновления", L"Check for updates"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"By Mansi / slfl@mail.ru");
     AppendMenuW(m, MF_STRING, IDM_EXIT, TW(L"Выход", L"Exit"));
@@ -2192,6 +2375,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             LOG_INFO(T("Уведомления: %s", "Notifications: %s"), g_cfg.notify ? T("вкл", "on") : T("выкл", "off"));
         }
         else if (id == IDM_AUTOSTART) autostart_toggle();
+        else if (id == IDM_CHECKUPDATE) run_update_async(0);
         else if (id == IDM_LANG_RU || id == IDM_LANG_EN) {
             g_lang = (id == IDM_LANG_EN) ? LANG_EN : LANG_RU;
             reg_set_str(L"Language", g_lang == LANG_EN ? "english" : "russian");
@@ -2265,6 +2449,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
     log_open(debug);         /* без -debug логи не создаются вообще */
     config_paths_init();     /* путь к config.ini нужен только для разовой миграции */
     settings_load();         /* из реестра (с импортом старого config.ini при первом запуске) */
+
+    /* Убираем «хвост» прошлого обновления: <exe>.old больше не занят.
+     * Старый процесс мог ещё завершаться — делаем несколько попыток. */
+    { WCHAR self[MAX_PATH], old[MAX_PATH];
+      GetModuleFileNameW(NULL, self, MAX_PATH);
+      _snwprintf(old, MAX_PATH, L"%s.old", self);
+      for (int i = 0; i < 10; i++) {
+          if (DeleteFileW(old) || GetLastError() == ERROR_FILE_NOT_FOUND) break;
+          Sleep(300);
+      } }
+
     if (!http_init()) {
         LOG_ERROR(T("WinHTTP не инициализирован.", "WinHTTP not initialized."));
         return 1;
