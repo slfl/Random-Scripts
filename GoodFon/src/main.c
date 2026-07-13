@@ -6,10 +6,10 @@
  *   - плавная смена обоев через IActiveDesktop (как в Python-версии);
  *   - логин на goodfon (JSON-ответ) + кэш cookie per-domain (com/ru);
  *   - скачивание случайной картинки нужного разрешения по теме;
- *   - избранное: like/unlike (локально + на сайте);
+ *   - избранное: favorite/unfavorite (локально + на сайте);
  *   - уведомления в трее (balloon) с подробностями;
  *   - автозапуск (реестр Run) переключается из меню;
- *   - режимы CLI: GoodFon.exe update|like|unlike — разовый запуск без трея.
+ *   - режимы CLI: GoodFon.exe update|favorite|unfavorite — разовый запуск без трея.
  *
  * Сборка (MSVC):  cmake -B build && cmake --build build --config Release
  * Линкуется с:    winhttp shell32 ole32 user32 advapi32 shlwapi gdi32
@@ -56,8 +56,8 @@ static const WCHAR *TW(const WCHAR *ru, const WCHAR *en) { return g_lang == LANG
 
 /* Пункты меню */
 #define IDM_UPDATE      100
-#define IDM_LIKE        101
-#define IDM_UNLIKE      102
+#define IDM_FAVORITE        101
+#define IDM_UNFAVORITE      102
 #define IDM_PAUSE       103
 #define IDM_AUTOSTART   104
 #define IDM_EXIT        105
@@ -70,7 +70,7 @@ static const WCHAR *TW(const WCHAR *ru, const WCHAR *en) { return g_lang == LANG
 #define IDM_LANG_EN     113
 #define IDM_CHECKUPDATE 114
 #define IDM_INT_BASE    200   /* интервал смены: 5/10/30/60 мин   */
-#define IDM_LIKEN_BASE  220   /* интервал избранного: 5/10/15/20  */
+#define IDM_FAVN_BASE  220   /* интервал избранного: 5/10/15/20  */
 #define IDM_RES_BASE    240   /* разрешение: HD/FullHD/2K/4K/Ориг */
 #define IDM_THEME_BASE  300   /* темы из встроенной таблицы       */
 
@@ -80,7 +80,7 @@ static const WCHAR *TW(const WCHAR *ru, const WCHAR *en) { return g_lang == LANG
 #define IMG_LIMIT       (64*1024*1024)  /* максимум картинки      */
 
 static const int g_intervals[4] = { 5, 10, 30, 60 };
-static const int g_like_ns[4]   = { 5, 10, 15, 20 };
+static const int g_favorite_ns[4]   = { 5, 10, 15, 20 };
 
 /* Разрешения для меню: отображаемое имя -> значение в конфиг.
  * "original" — особый режим: берётся любое (самое большое) доступное.  */
@@ -167,7 +167,7 @@ typedef struct {
     char theme[64];                     /* активная тема */
     char save_dir[MAX_PATH];
     int  max_files;
-    int  like_every_n;
+    int  favorite_every_n;
     int  max_attempts;
     int  notify;
     char domain_pref[8];                /* com / ru / auto */
@@ -176,8 +176,7 @@ typedef struct {
 } Config;
 
 static Config g_cfg;
-static WCHAR  g_config_path[MAX_PATH];
-static WCHAR  g_like_dir[MAX_PATH];
+static WCHAR  g_favorite_dir[MAX_PATH];
 static WCHAR  g_current_image[MAX_PATH];  /* точный файл, который сейчас на экране */
 
 /* Cookie-джар per-domain (наш собственный, WinHTTP-cookies отключены) */
@@ -293,39 +292,9 @@ static int extract_attr(const char *p, const char *attr, char *out, size_t outsz
     return i > 0;
 }
 
-/* ================= Конфиг: чтение / запись ================= */
-
-static void config_paths_init(void)
-{
-    GetModuleFileNameW(NULL, g_config_path, MAX_PATH);
-    PathRemoveFileSpecW(g_config_path);
-    PathAppendW(g_config_path, L"config.ini");
-}
-
-static char *read_file_utf8(const WCHAR *path, size_t *outLen)
-{
-    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                           OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
-    DWORD sz = GetFileSize(h, NULL), rd = 0;
-    char *buf = (char *)malloc(sz + 1);
-    if (!buf) { CloseHandle(h); return NULL; }
-    ReadFile(h, buf, sz, &rd, NULL);
-    CloseHandle(h);
-    buf[rd] = 0;
-    /* срезаем BOM, если есть */
-    if (rd >= 3 && (unsigned char)buf[0] == 0xEF &&
-        (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF)
-        memmove(buf, buf + 3, rd - 2);
-    if (outLen) *outLen = strlen(buf);
-    return buf;
-}
-
 /* ============ Хранилище настроек: реестр HKCU\Software\GoodFon ============ */
 
 #define REG_PATH L"Software\\GoodFon"
-
-static int config_get(const char *section, const char *key, char *out, size_t outsz); /* fwd */
 
 static HKEY reg_open(REGSAM access)
 {
@@ -426,34 +395,7 @@ static int reg_get_password(char *out, int outsz)
     return ok;
 }
 
-/* Разовый импорт старого config.ini в реестр (при первом запуске новой версии). */
-static int migrate_ini_to_registry(void)
-{
-    if (GetFileAttributesW(g_config_path) == INVALID_FILE_ATTRIBUTES) return 0;
-    char v[JAR_SIZE];
-    if (!config_get("settings", "theme", v, sizeof(v)) || !v[0]) return 0;
-
-    reg_set_str(L"theme", v);
-    if (config_get("auth", "login", v, sizeof(v)) && strcmp(v, "your_login"))
-        reg_set_str(L"login", v);
-    if (config_get("auth", "password", v, sizeof(v)) && v[0] && strcmp(v, "your_password"))
-        reg_set_password(v);
-    if (config_get("auth", "session_com", v, sizeof(v))) reg_set_str(L"session_com", v);
-    if (config_get("auth", "session_ru", v, sizeof(v)))  reg_set_str(L"session_ru", v);
-    if (config_get("settings", "resolution", v, sizeof(v))) reg_set_str(L"resolution", v);
-    if (config_get("settings", "save_dir", v, sizeof(v)))   reg_set_str(L"save_dir", v);
-    if (config_get("settings", "domain", v, sizeof(v)))     reg_set_str(L"domain", v);
-    if (config_get("settings", "max_files", v, sizeof(v)))    reg_set_dword(L"max_files", atoi(v));
-    if (config_get("settings", "like_every_n", v, sizeof(v))) reg_set_dword(L"like_every_n", atoi(v));
-    if (config_get("settings", "max_attempts", v, sizeof(v))) reg_set_dword(L"max_attempts", atoi(v));
-    if (config_get("settings", "notify", v, sizeof(v)))       reg_set_dword(L"notify", !_stricmp(v, "true"));
-    if (config_get("settings", "interval_min", v, sizeof(v))) reg_set_dword(L"interval_min", atoi(v));
-    if (config_get("state", "counter", v, sizeof(v)))         reg_set_dword(L"counter", atoi(v));
-    LOG_INFO(T("Настройки перенесены из config.ini в реестр HKCU\\Software\\GoodFon", "Settings migrated from config.ini to registry key HKCU/Software/GoodFon"));
-    return 1;
-}
-
-/* Записать значения по умолчанию (когда реестр пуст и мигрировать нечего). */
+/* Записать значения по умолчанию (когда реестр пуст). */
 static void settings_write_defaults(void)
 {
     reg_set_str(L"login", "");
@@ -464,7 +406,7 @@ static void settings_write_defaults(void)
     reg_set_str(L"session_com", "");
     reg_set_str(L"session_ru", "");
     reg_set_dword(L"max_files", 10);
-    reg_set_dword(L"like_every_n", 10);
+    reg_set_dword(L"favorite_every_n", 10);
     reg_set_dword(L"max_attempts", 3);
     reg_set_dword(L"notify", 1);
     reg_set_dword(L"interval_min", 10);
@@ -478,12 +420,10 @@ static int settings_load(void)
 {
     memset(&g_cfg, 0, sizeof(g_cfg));
 
-    /* Реестр пуст? Сначала пробуем импорт config.ini, иначе пишем дефолты. */
+    /* Реестр пуст? Пишем значения по умолчанию. */
     char probe[64];
-    if (!reg_get_str(L"theme", probe, sizeof(probe)) || !probe[0]) {
-        if (!migrate_ini_to_registry())
-            settings_write_defaults();
-    }
+    if (!reg_get_str(L"theme", probe, sizeof(probe)) || !probe[0])
+        settings_write_defaults();
 
     reg_get_str(L"login", g_cfg.login, sizeof(g_cfg.login));
     reg_get_password(g_cfg.password, sizeof(g_cfg.password));
@@ -505,7 +445,7 @@ static int settings_load(void)
         strcpy(g_cfg.domain_pref, "auto");
 
     g_cfg.max_files    = reg_get_dword(L"max_files", 10);
-    g_cfg.like_every_n = reg_get_dword(L"like_every_n", 10);
+    g_cfg.favorite_every_n = reg_get_dword(L"favorite_every_n", 10);
     g_cfg.max_attempts = reg_get_dword(L"max_attempts", 3);
     g_cfg.notify       = reg_get_dword(L"notify", 1);
     g_cfg.interval_min = reg_get_dword(L"interval_min", 10);
@@ -527,15 +467,15 @@ static int settings_load(void)
 
     WCHAR wtheme[64];
     utf8_to_wide(g_cfg.theme, wtheme, 64);
-    wcscpy(g_like_dir, wsave);
-    PathAppendW(g_like_dir, L"Favorite");
-    PathAppendW(g_like_dir, wtheme);
+    wcscpy(g_favorite_dir, wsave);
+    PathAppendW(g_favorite_dir, L"Favorite");
+    PathAppendW(g_favorite_dir, wtheme);
 
     strncpy(g_jar_com, g_cfg.session_com, JAR_SIZE - 1);
     strncpy(g_jar_ru,  g_cfg.session_ru,  JAR_SIZE - 1);
 
     {
-        char l8[MAX_PATH * 3]; wide_to_utf8(g_like_dir, l8, sizeof(l8));
+        char l8[MAX_PATH * 3]; wide_to_utf8(g_favorite_dir, l8, sizeof(l8));
         LOG_INFO(T("Настройки загружены из реестра. Тема: %s | save_dir: %s", "Settings loaded from registry. Theme: %s | save_dir: %s"),
                  g_cfg.theme, g_cfg.save_dir);
         LOG_INFO(T("Папка избранного: %s", "Favorites folder: %s"), l8);
@@ -548,47 +488,7 @@ static void counter_save(void)
     reg_set_dword(L"counter", g_cfg.counter);
 }
 
-/* Прочитать одно значение key из секции section прямо из файла.
- * Нужно, чтобы диалог логина показывал актуальные данные, даже если
- * их поменяли в config.ini вручную во время работы приложения.      */
-static int config_get(const char *section, const char *key, char *out, size_t outsz)
-{
-    out[0] = 0;
-    size_t len;
-    char *text = read_file_utf8(g_config_path, &len);
-    if (!text) return 0;
-
-    char cur[32] = "";
-    int found = 0;
-    char *ctx = NULL;
-    char *line = strtok_s(text, "\n", &ctx);
-    while (line) {
-        char buf[JAR_SIZE + 64];
-        strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
-        str_trim(buf);
-        if (buf[0] == '[') {
-            char *e = strchr(buf, ']');
-            if (e) { *e = 0; strncpy(cur, buf + 1, sizeof(cur) - 1); CharLowerA(cur); }
-        } else if (buf[0] && buf[0] != ';' && buf[0] != '#' && !_stricmp(cur, section)) {
-            char *eq = strchr(buf, '=');
-            if (eq) {
-                *eq = 0;
-                char k[64]; strncpy(k, buf, sizeof(k) - 1); k[sizeof(k) - 1] = 0;
-                str_trim(k); CharLowerA(k);
-                if (!strcmp(k, key)) {
-                    char *v = eq + 1; str_trim(v);
-                    strncpy(out, v, outsz - 1); out[outsz - 1] = 0;
-                    found = 1; break;
-                }
-            }
-        }
-        line = strtok_s(NULL, "\n", &ctx);
-    }
-    free(text);
-    return found;
-}
-
-/* Есть ли у нас авторизация: живой кэш сессии или заданные логин+пароль.
+/* Есть ли у нас авторизация: заданные логин+пароль.
  * Используется для гейтинга раздела "Эротика" (доступен только после входа). */
 static int is_authorized(void)
 {
@@ -1465,12 +1365,12 @@ static int favorite_api(const char *page_url, int add)
 
 /* ============ Сценарии ============ */
 
-static void fallback_local(int like_only)
+static void fallback_local(int favorite_only)
 {
     WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
     WCHAR chosen[MAX_PATH];
-    int got = random_file_excluding(g_like_dir, cur, chosen, MAX_PATH);
-    if (!got && !like_only) {
+    int got = random_file_excluding(g_favorite_dir, cur, chosen, MAX_PATH);
+    if (!got && !favorite_only) {
         WCHAR wdir[MAX_PATH]; utf8_to_wide(g_cfg.save_dir, wdir, MAX_PATH);
         got = random_file_excluding(wdir, cur, chosen, MAX_PATH);
     }
@@ -1484,18 +1384,18 @@ static void fallback_local(int like_only)
     set_wallpaper(chosen);
     WCHAR info[300];
     _snwprintf(info, 300, L"%s", PathFindFileNameW(chosen));
-    notify_user(like_only ? TW(L"Обои обновлены — из избранного", L"Wallpaper updated — from favorites")
+    notify_user(favorite_only ? TW(L"Обои обновлены — из избранного", L"Wallpaper updated — from favorites")
                           : TW(L"Обои обновлены — локально", L"Wallpaper updated — locally"), info);
 }
 
-static int set_wallpaper_from_like(void)
+static int set_wallpaper_from_favorite(void)
 {
-    char d8[MAX_PATH * 3]; wide_to_utf8(g_like_dir, d8, sizeof(d8));
-    LOG_INFO(T("Favorite-папка: %s (найдено файлов: %d)", "Favorite folder: %s (files found: %d)"), d8, dir_count(g_like_dir));
+    char d8[MAX_PATH * 3]; wide_to_utf8(g_favorite_dir, d8, sizeof(d8));
+    LOG_INFO(T("Favorite-папка: %s (найдено файлов: %d)", "Favorite folder: %s (files found: %d)"), d8, dir_count(g_favorite_dir));
 
     WCHAR cur[MAX_PATH]; get_current_wallpaper(cur, MAX_PATH);
     WCHAR chosen[MAX_PATH];
-    if (!random_file_excluding(g_like_dir, cur, chosen, MAX_PATH)) {
+    if (!random_file_excluding(g_favorite_dir, cur, chosen, MAX_PATH)) {
         LOG_WARN(T("Папка Favorite/%s пуста, загружаем с сайта", "Folder Favorite/%s is empty, downloading from site"), g_cfg.theme);
         return 0;
     }
@@ -1521,10 +1421,10 @@ static void do_update(void)
 
     g_cfg.counter++;
     counter_save();
-    LOG_INFO(T("Запуск #%d (из Favorite каждые %d)", "Run #%d (from Favorite every %d)"), g_cfg.counter, g_cfg.like_every_n);
-    if (g_cfg.counter >= g_cfg.like_every_n) {
+    LOG_INFO(T("Запуск #%d (из Favorite каждые %d)", "Run #%d (from Favorite every %d)"), g_cfg.counter, g_cfg.favorite_every_n);
+    if (g_cfg.counter >= g_cfg.favorite_every_n) {
         g_cfg.counter = 0; counter_save();
-        if (set_wallpaper_from_like()) return;
+        if (set_wallpaper_from_favorite()) return;
         LOG_INFO(T("Папка Favorite пуста, продолжаем загрузку с сайта", "Favorite folder is empty, continuing download from site"));
     }
 
@@ -1615,7 +1515,7 @@ static void do_update(void)
     fallback_local(0);
 }
 
-static void do_like(void)
+static void do_favorite(void)
 {
     if (!ensure_session()) {
         notify_user(TW(L"GoodFon: сайт недоступен", L"GoodFon: site unavailable"), TW(L"Операция с избранным невозможна.", L"Favorites operation not possible."));
@@ -1632,13 +1532,13 @@ static void do_like(void)
         return;
     }
 
-    SHCreateDirectoryExW(NULL, g_like_dir, NULL);
+    SHCreateDirectoryExW(NULL, g_favorite_dir, NULL);
     WCHAR dest[MAX_PATH];
     /* если картинка уже в папке избранного — не копируем, работаем по ней */
-    if (StrStrIW(cur, g_like_dir) == cur) {
+    if (StrStrIW(cur, g_favorite_dir) == cur) {
         wcscpy(dest, cur);
     } else {
-        _snwprintf(dest, MAX_PATH, L"%s\\%s", g_like_dir, PathFindFileNameW(cur));
+        _snwprintf(dest, MAX_PATH, L"%s\\%s", g_favorite_dir, PathFindFileNameW(cur));
         if (GetFileAttributesW(dest) == INVALID_FILE_ATTRIBUTES)
             CopyFileW(cur, dest, FALSE);
         LOG_INFO(T("Изображение скопировано в папку Favorite/%s", "Image copied to folder Favorite/%s"), g_cfg.theme);
@@ -1655,7 +1555,7 @@ static void do_like(void)
         LOG_WARN(T("Не удалось добавить в избранное на сайте.", "Failed to add to favorites on the site."));
 }
 
-static void do_unlike(void)
+static void do_unfavorite(void)
 {
     if (!ensure_session()) {
         notify_user(TW(L"GoodFon: сайт недоступен", L"GoodFon: site unavailable"), TW(L"Операция с избранным невозможна.", L"Favorites operation not possible."));
@@ -1663,8 +1563,8 @@ static void do_unlike(void)
     }
     WCHAR cur[MAX_PATH];
     wcsncpy(cur, g_current_image, MAX_PATH - 1); cur[MAX_PATH - 1] = 0;
-    if (!cur[0] || StrStrIW(cur, g_like_dir) != cur) {
-        LOG_ERROR(T("Текущие обои не из папки Favorite — unlike невозможен.", "Current wallpaper is not from the Favorite folder — unlike impossible."));
+    if (!cur[0] || StrStrIW(cur, g_favorite_dir) != cur) {
+        LOG_ERROR(T("Текущие обои не из папки Favorite — удаление из избранного невозможно.", "Current wallpaper is not from the Favorite folder — cannot remove from favorites."));
         notify_user(TW(L"GoodFon: ошибка", L"GoodFon: error"), TW(L"Текущие обои не из папки избранного.", L"Current wallpaper is not from the favorites folder."));
         return;
     }
@@ -1835,22 +1735,22 @@ static void sync_favorites(void)
 
     /* Удаление локальных картинок, которых нет в избранном на сайте.
      * Чистим корень Favorite и все подпапки Favorite\<тема> (сайт плоский). */
-    WCHAR wsave[MAX_PATH], like_base[MAX_PATH];
+    WCHAR wsave[MAX_PATH], favorite_base[MAX_PATH];
     utf8_to_wide(g_cfg.save_dir, wsave, MAX_PATH);
-    wcscpy(like_base, wsave); PathAppendW(like_base, L"Favorite");
+    wcscpy(favorite_base, wsave); PathAppendW(favorite_base, L"Favorite");
 
     int deleted = 0, kept = 0;
 
     /* список директорий для чистки: сам Favorite + его подпапки */
     WCHAR dirs[128][MAX_PATH]; int nd = 0;
-    wcscpy(dirs[nd++], like_base);
-    WCHAR pat[MAX_PATH]; _snwprintf(pat, MAX_PATH, L"%s\\*", like_base);
+    wcscpy(dirs[nd++], favorite_base);
+    WCHAR pat[MAX_PATH]; _snwprintf(pat, MAX_PATH, L"%s\\*", favorite_base);
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-            if (nd < 128) _snwprintf(dirs[nd++], MAX_PATH, L"%s\\%s", like_base, fd.cFileName);
+            if (nd < 128) _snwprintf(dirs[nd++], MAX_PATH, L"%s\\%s", favorite_base, fd.cFileName);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -1925,8 +1825,8 @@ static DWORD WINAPI worker_thread(LPVOID param)
     int action = (int)(INT_PTR)param;
     switch (action) {
         case IDM_UPDATE: do_update(); break;
-        case IDM_LIKE:   do_like();   break;
-        case IDM_UNLIKE: do_unlike(); break;
+        case IDM_FAVORITE:   do_favorite();   break;
+        case IDM_UNFAVORITE: do_unfavorite(); break;
         case IDM_LOGIN:
             if (ensure_session()) {
                 LOG_INFO(T("Авторизация через меню успешна.", "Sign-in from menu successful."));
@@ -2247,8 +2147,8 @@ static void show_menu(void)
 {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, IDM_UPDATE, TW(L"Сменить обои сейчас", L"Change wallpaper now"));
-    AppendMenuW(m, MF_STRING, IDM_LIKE,   TW(L"Добавить в избранное ♥", L"Add to favorites ♥"));
-    AppendMenuW(m, MF_STRING, IDM_UNLIKE, TW(L"Убрать из избранного ♡", L"Remove from favorites ♡"));
+    AppendMenuW(m, MF_STRING, IDM_FAVORITE,   TW(L"Добавить в избранное ♥", L"Add to favorites ♥"));
+    AppendMenuW(m, MF_STRING, IDM_UNFAVORITE, TW(L"Убрать из избранного ♡", L"Remove from favorites ♡"));
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
     HMENU mi = CreatePopupMenu();
@@ -2261,9 +2161,9 @@ static void show_menu(void)
 
     HMENU ml = CreatePopupMenu();
     for (int i = 0; i < 4; i++) {
-        WCHAR t[48]; _snwprintf(t, 48, TW(L"каждая %d-я", L"every %dth"), g_like_ns[i]);
-        UINT fl = MF_STRING | (g_cfg.like_every_n == g_like_ns[i] ? MF_CHECKED : 0);
-        AppendMenuW(ml, fl, IDM_LIKEN_BASE + i, t);
+        WCHAR t[48]; _snwprintf(t, 48, TW(L"каждая %d-я", L"every %dth"), g_favorite_ns[i]);
+        UINT fl = MF_STRING | (g_cfg.favorite_every_n == g_favorite_ns[i] ? MF_CHECKED : 0);
+        AppendMenuW(ml, fl, IDM_FAVN_BASE + i, t);
     }
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ml, TW(L"Из избранного", L"From favorites"));
 
@@ -2345,9 +2245,9 @@ static void select_theme(int idx)
     WCHAR wsave[MAX_PATH], wtheme[64];
     utf8_to_wide(g_cfg.save_dir, wsave, MAX_PATH);
     utf8_to_wide(g_cfg.theme, wtheme, 64);
-    wcscpy(g_like_dir, wsave);
-    PathAppendW(g_like_dir, L"Favorite");
-    PathAppendW(g_like_dir, wtheme);
+    wcscpy(g_favorite_dir, wsave);
+    PathAppendW(g_favorite_dir, L"Favorite");
+    PathAppendW(g_favorite_dir, wtheme);
     LOG_INFO(T("Активная тема: %s (сменится по таймеру или вручную)", "Active theme: %s (will change on timer or manually)"), g_cfg.theme);
 }
 
@@ -2365,7 +2265,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_COMMAND: {
         int id = LOWORD(wp);
-        if (id == IDM_UPDATE || id == IDM_LIKE || id == IDM_UNLIKE)
+        if (id == IDM_UPDATE || id == IDM_FAVORITE || id == IDM_UNFAVORITE)
             run_async(id);
         else if (id == IDM_SETCREDS) prompt_credentials();
         else if (id == IDM_REGISTER) account_register();
@@ -2394,10 +2294,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             apply_interval();
             LOG_INFO(T("Интервал смены: %d мин", "Change interval: %d min"), g_cfg.interval_min);
         }
-        else if (id >= IDM_LIKEN_BASE && id < IDM_LIKEN_BASE + 4) {
-            g_cfg.like_every_n = g_like_ns[id - IDM_LIKEN_BASE];
-            reg_set_dword(L"like_every_n", g_cfg.like_every_n);
-            LOG_INFO(T("Из избранного: каждая %d-я картинка", "From favorites: every %d-th image"), g_cfg.like_every_n);
+        else if (id >= IDM_FAVN_BASE && id < IDM_FAVN_BASE + 4) {
+            g_cfg.favorite_every_n = g_favorite_ns[id - IDM_FAVN_BASE];
+            reg_set_dword(L"favorite_every_n", g_cfg.favorite_every_n);
+            LOG_INFO(T("Из избранного: каждая %d-я картинка", "From favorites: every %d-th image"), g_cfg.favorite_every_n);
         }
         else if (id >= IDM_RES_BASE && id < IDM_RES_BASE + RES_COUNT) {
             strncpy(g_cfg.resolution, g_reses[id - IDM_RES_BASE].value,
@@ -2432,7 +2332,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
     g_hinst = hInst;
     srand(GetTickCount());
 
-    /* Разбор аргументов: -debug включает логи; update/like/unlike — разовый режим.
+    /* Разбор аргументов: -debug включает логи; update/favorite/unfavorite — разовый режим.
      * Порядок и наличие дефиса не важны: "GoodFon.exe update -debug" тоже ок.   */
     int debug = 0;
     WCHAR cmd[32] = L"";
@@ -2443,14 +2343,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
         CharLowerW(a);
         WCHAR *p = a; while (*p == L'-') p++;
         if (!wcscmp(p, L"debug")) debug = 1;
-        else if (!wcscmp(p, L"update") || !wcscmp(p, L"like") || !wcscmp(p, L"unlike"))
+        else if (!wcscmp(p, L"update") || !wcscmp(p, L"favorite") || !wcscmp(p, L"unfavorite"))
             wcsncpy(cmd, p, 31);
     }
     LocalFree(argv);
 
     log_open(debug);         /* без -debug логи не создаются вообще */
-    config_paths_init();     /* путь к config.ini нужен только для разовой миграции */
-    settings_load();         /* из реестра (с импортом старого config.ini при первом запуске) */
+    settings_load();         /* из реестра */
 
     /* Убираем «хвост» прошлого обновления: <exe>.old больше не занят.
      * Старый процесс мог ещё завершаться — делаем несколько попыток. */
@@ -2467,11 +2366,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
         return 1;
     }
 
-    /* CLI-режим: update / like / unlike — разово и выйти */
+    /* CLI-режим: update / favorite / unfavorite — разово и выйти */
     if (cmd[0]) {
         if (!wcscmp(cmd, L"update")) do_update();
-        else if (!wcscmp(cmd, L"like"))   do_like();
-        else if (!wcscmp(cmd, L"unlike")) do_unlike();
+        else if (!wcscmp(cmd, L"favorite"))   do_favorite();
+        else if (!wcscmp(cmd, L"unfavorite")) do_unfavorite();
         return 0;
     }
 
