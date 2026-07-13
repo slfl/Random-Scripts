@@ -2205,19 +2205,24 @@ static void show_menu(void)
         AppendMenuW(macc, MF_STRING, IDM_LOGOUT, TW(L"Выйти из аккаунта", L"Sign out"));
     AppendMenuW(m, MF_POPUP, (UINT_PTR)macc, TW(L"Аккаунт", L"Account"));
 
+    /* Подменю "Настройки": пауза, уведомления, автозапуск, обновления, язык */
+    HMENU mset = CreatePopupMenu();
+    AppendMenuW(mset, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, TW(L"Пауза", L"Pause"));
+    AppendMenuW(mset, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0),
+                IDM_NOTIFY, TW(L"Включить уведомления", L"Enable notifications"));
+    AppendMenuW(mset, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
+                IDM_AUTOSTART, TW(L"Автозапуск с Windows", L"Start with Windows"));
+    AppendMenuW(mset, MF_STRING, IDM_CHECKUPDATE, TW(L"Проверить обновления", L"Check for updates"));
+
     HMENU mlang = CreatePopupMenu();
     AppendMenuW(mlang, MF_STRING | (g_lang == LANG_RU ? MF_CHECKED : 0),
                 IDM_LANG_RU, L"Русский");
     AppendMenuW(mlang, MF_STRING | (g_lang == LANG_EN ? MF_CHECKED : 0),
                 IDM_LANG_EN, L"English");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mlang, TW(L"Язык", L"Language"));
+    AppendMenuW(mset, MF_POPUP, (UINT_PTR)mlang, TW(L"Язык", L"Language"));
 
-    AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), IDM_PAUSE, TW(L"Пауза", L"Pause"));
-    AppendMenuW(m, MF_STRING | (g_cfg.notify ? MF_CHECKED : 0),
-                IDM_NOTIFY, TW(L"Включить уведомления", L"Enable notifications"));
-    AppendMenuW(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0),
-                IDM_AUTOSTART, TW(L"Автозапуск с Windows", L"Start with Windows"));
-    AppendMenuW(m, MF_STRING, IDM_CHECKUPDATE, TW(L"Проверить обновления", L"Check for updates"));
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mset, TW(L"Настройки", L"Settings"));
+
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"By Mansi / slfl@mail.ru");
     AppendMenuW(m, MF_STRING, IDM_EXIT, TW(L"Выход", L"Exit"));
