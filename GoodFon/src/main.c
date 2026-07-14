@@ -44,7 +44,7 @@
 #define UPD_TIMER_ID    2
 
 /* Обновление с GitHub (raw): сравниваем хэш локального exe с удалённым. */
-#define UPDATE_BASE  L"https://github.com/slfl/Random-Scripts/raw/refs/heads/main/GoodFon"
+#define UPDATE_BASE  L"https://github.com/slfl/GoodFon/raw/refs/heads/main"
 #if defined(_WIN64)
 #define UPDATE_EXE_URL  UPDATE_BASE L"/GoodFon-x64.exe"
 #else
@@ -115,6 +115,10 @@ static void theme_brushes_rebuild(void)
 #define IDC_ST_STATUS   3019
 #define IDC_CB_UPDINT   3020
 #define IDC_ST_UPDATE   3021
+#define IDC_CB_MAXFILES 3022
+#define IDC_CB_SAVELOC  3023
+#define IDC_BTN_BROWSE  3024
+#define IDC_ST_SAVEPATH 3025
 
 #define MAX_THEMES      64
 #define JAR_SIZE        4096
@@ -847,6 +851,31 @@ static const CLSID CLSID_ActiveDesktop_ =
 static const IID IID_IActiveDesktop_ =
 { 0xF490EB00, 0x1240, 0x11D1, {0x98,0x88,0x00,0x60,0x97,0xDE,0xAC,0xF9} };
 
+/* IDesktopWallpaper (Windows 8+): установка обоев отдельно на каждый монитор
+ * и режим позиционирования "растянуть". Объявляем минимальный интерфейс сами. */
+typedef struct MyDesktopWallpaper MyDesktopWallpaper;
+typedef struct {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(MyDesktopWallpaper *, REFIID, void **);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(MyDesktopWallpaper *);
+    ULONG   (STDMETHODCALLTYPE *Release)(MyDesktopWallpaper *);
+    HRESULT (STDMETHODCALLTYPE *SetWallpaper)(MyDesktopWallpaper *, LPCWSTR, LPCWSTR);
+    HRESULT (STDMETHODCALLTYPE *GetWallpaper)(MyDesktopWallpaper *, LPCWSTR, LPWSTR *);
+    HRESULT (STDMETHODCALLTYPE *GetMonitorDevicePathAt)(MyDesktopWallpaper *, UINT, LPWSTR *);
+    HRESULT (STDMETHODCALLTYPE *GetMonitorDevicePathCount)(MyDesktopWallpaper *, UINT *);
+    HRESULT (STDMETHODCALLTYPE *GetMonitorRECT)(MyDesktopWallpaper *, LPCWSTR, RECT *);
+    HRESULT (STDMETHODCALLTYPE *SetBackgroundColor)(MyDesktopWallpaper *, COLORREF);
+    HRESULT (STDMETHODCALLTYPE *GetBackgroundColor)(MyDesktopWallpaper *, COLORREF *);
+    HRESULT (STDMETHODCALLTYPE *SetPosition)(MyDesktopWallpaper *, int);
+    /* остальные методы интерфейса не используются */
+} MyDesktopWallpaperVtbl;
+struct MyDesktopWallpaper { const MyDesktopWallpaperVtbl *lpVtbl; };
+
+static const CLSID CLSID_DesktopWallpaper_ =
+{ 0xC2CF3110, 0x460E, 0x4fc1, {0xB9,0xD0,0x8A,0x1C,0x0C,0x9C,0xC4,0xBD} };
+static const IID IID_IDesktopWallpaper_ =
+{ 0xB92B56A9, 0x8B55, 0x4E14, {0x9A,0x89,0x01,0x99,0xBB,0xB6,0xF9,0x3B} };
+#define DWPOS_STRETCH_ 2
+
 static void enable_active_desktop(void)
 {
     HWND progman = FindWindowW(L"Progman", NULL);
@@ -867,6 +896,70 @@ static void force_refresh(void)
     }
 }
 
+/* Собрать список картинок из папки primary (сам primary первым) — чтобы на
+ * разные мониторы поставить разные обои. Возвращает количество. */
+static int gather_images(const WCHAR *primary, WCHAR list[][MAX_PATH], int maxn)
+{
+    int n = 0;
+    wcsncpy(list[n], primary, MAX_PATH - 1); list[n][MAX_PATH - 1] = 0; n++;
+    WCHAR dir[MAX_PATH]; wcscpy(dir, primary); PathRemoveFileSpecW(dir);
+    WCHAR pat[MAX_PATH]; PathCombineW(pat, dir, L"*.*");
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const WCHAR *ext = PathFindExtensionW(fd.cFileName);
+            if (!ext) continue;
+            if (_wcsicmp(ext, L".jpg") && _wcsicmp(ext, L".jpeg") && _wcsicmp(ext, L".png") &&
+                _wcsicmp(ext, L".webp") && _wcsicmp(ext, L".bmp")) continue;
+            WCHAR full[MAX_PATH]; PathCombineW(full, dir, fd.cFileName);
+            if (!_wcsicmp(full, primary)) continue;
+            if (n < maxn) { wcsncpy(list[n], full, MAX_PATH - 1); list[n][MAX_PATH - 1] = 0; n++; }
+            else break;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return n;
+}
+
+/* Установить обои на каждый монитор (режим "растянуть") через IDesktopWallpaper.
+ * paths[i % npaths] — своя картинка на монитор. Возвращает 1 при успехе. */
+static int idw_set_multi(const WCHAR **paths, int npaths)
+{
+    MyDesktopWallpaper *dw = NULL;
+    if (FAILED(CoCreateInstance(&CLSID_DesktopWallpaper_, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IDesktopWallpaper_, (void **)&dw)) || !dw)
+        return 0;
+    int ok = 0;
+    dw->lpVtbl->SetPosition(dw, DWPOS_STRETCH_);
+    UINT count = 0;
+    if (SUCCEEDED(dw->lpVtbl->GetMonitorDevicePathCount(dw, &count)) && count > 0) {
+        ok = 1;
+        for (UINT i = 0; i < count; i++) {
+            LPWSTR id = NULL;
+            if (SUCCEEDED(dw->lpVtbl->GetMonitorDevicePathAt(dw, i, &id)) && id) {
+                HRESULT hr = dw->lpVtbl->SetWallpaper(dw, id, paths[i % npaths]);
+                if (FAILED(hr)) ok = 0;
+                CoTaskMemFree(id);
+            } else ok = 0;
+        }
+        LOG_INFO(T("IDesktopWallpaper: мониторов %u, режим Растянуть", "IDesktopWallpaper: monitors %u, Stretch mode"), count);
+    }
+    dw->lpVtbl->Release(dw);
+    return ok;
+}
+
+/* Стиль обоев "растянуть" в реестре — для запасного пути через SPI. */
+static void wp_style_stretch_reg(void)
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        RegSetValueExW(k, L"WallpaperStyle", 0, REG_SZ, (const BYTE *)L"2", 2 * sizeof(WCHAR));
+        RegSetValueExW(k, L"TileWallpaper",  0, REG_SZ, (const BYTE *)L"0", 2 * sizeof(WCHAR));
+        RegCloseKey(k);
+    }
+}
+
 static int set_wallpaper(const WCHAR *path)
 {
     char p8[MAX_PATH * 3]; wide_to_utf8(path, p8, sizeof(p8));
@@ -878,32 +971,43 @@ static int set_wallpaper(const WCHAR *path)
 
     enable_active_desktop();
     HRESULT hrInit = CoInitialize(NULL);
-    MyActiveDesktop *pad = NULL;
-#ifdef __cplusplus
-    HRESULT hr = CoCreateInstance(CLSID_ActiveDesktop_, NULL,
-                                  CLSCTX_INPROC_SERVER,
-                                  IID_IActiveDesktop_, (void **)&pad);
-#else
-    HRESULT hr = CoCreateInstance(&CLSID_ActiveDesktop_, NULL,
-                                  CLSCTX_INPROC_SERVER,
-                                  &IID_IActiveDesktop_, (void **)&pad);
-#endif
+
+    /* Основной путь (Win8+): IDesktopWallpaper — режим "растянуть" и своя
+     * картинка на каждый монитор (в расширенном рабочем столе). */
     int ok = 0;
-    if (SUCCEEDED(hr) && pad) {
-        HRESULT h1 = pad->lpVtbl->SetWallpaper(pad, path, 0);
-        HRESULT h2 = pad->lpVtbl->ApplyChanges(pad, AD_APPLY_ALL_);
-        pad->lpVtbl->Release(pad);
-        LOG_INFO("IActiveDesktop: SetWallpaper=0x%08lX ApplyChanges=0x%08lX",
-                 (unsigned long)h1, (unsigned long)h2);
-        ok = SUCCEEDED(h1) && SUCCEEDED(h2);
-    } else {
-        LOG_WARN(T("IActiveDesktop недоступен: CoCreateInstance=0x%08lX", "IActiveDesktop unavailable: CoCreateInstance=0x%08lX"),
-                 (unsigned long)hr);
+    {
+        int nmon = GetSystemMetrics(SM_CMONITORS); if (nmon < 1) nmon = 1; if (nmon > 16) nmon = 16;
+        static WCHAR list[16][MAX_PATH];
+        int have = gather_images(path, list, nmon);
+        const WCHAR *ptrs[16];
+        for (int i = 0; i < have; i++) ptrs[i] = list[i];
+        if (have > 0) ok = idw_set_multi(ptrs, have);
+    }
+
+    MyActiveDesktop *pad = NULL;
+    if (!ok) {
+        /* запасной путь: IActiveDesktop (плавно) + стиль "растянуть" в реестре */
+        wp_style_stretch_reg();
+        HRESULT hr = CoCreateInstance(&CLSID_ActiveDesktop_, NULL,
+                                      CLSCTX_INPROC_SERVER,
+                                      &IID_IActiveDesktop_, (void **)&pad);
+        if (SUCCEEDED(hr) && pad) {
+            HRESULT h1 = pad->lpVtbl->SetWallpaper(pad, path, 0);
+            HRESULT h2 = pad->lpVtbl->ApplyChanges(pad, AD_APPLY_ALL_);
+            pad->lpVtbl->Release(pad);
+            LOG_INFO("IActiveDesktop: SetWallpaper=0x%08lX ApplyChanges=0x%08lX",
+                     (unsigned long)h1, (unsigned long)h2);
+            ok = SUCCEEDED(h1) && SUCCEEDED(h2);
+        } else {
+            LOG_WARN(T("IActiveDesktop недоступен: CoCreateInstance=0x%08lX", "IActiveDesktop unavailable: CoCreateInstance=0x%08lX"),
+                     (unsigned long)hr);
+        }
     }
     if (SUCCEEDED(hrInit)) CoUninitialize();
 
     if (!ok) {
         /* запасной путь без плавности */
+        wp_style_stretch_reg();
         if (SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)path,
                                   SPIF_UPDATEINIFILE | SPIF_SENDCHANGE)) {
             LOG_INFO(T("Fallback SPI_SETDESKWALLPAPER: успех", "Fallback SPI_SETDESKWALLPAPER: success"));
@@ -913,22 +1017,6 @@ static int set_wallpaper(const WCHAR *path)
         }
     } else {
         force_refresh();
-        /* Проверяем, что система реально применила именно наш файл:
-         * IActiveDesktop может вернуть S_OK, но молча не применить
-         * (например, для .webp). Тогда форсим через SPI.            */
-        WCHAR cur[MAX_PATH] = L"";
-        SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, cur, 0);
-        if (_wcsicmp(cur, path) != 0) {
-            char c8[MAX_PATH * 3]; wide_to_utf8(cur, c8, sizeof(c8));
-            LOG_WARN(T("IActiveDesktop применил не наш файл (сейчас: %s) — форсим SPI", "IActiveDesktop applied a different file (now: %s) — forcing SPI"), c8);
-            if (SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)path,
-                                      SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
-                LOG_INFO(T("SPI_SETDESKWALLPAPER: успех", "SPI_SETDESKWALLPAPER: success"));
-            else {
-                LOG_ERROR(T("SPI_SETDESKWALLPAPER: ошибка %lu", "SPI_SETDESKWALLPAPER: error %lu"), GetLastError());
-                ok = 0;
-            }
-        }
     }
 
     if (ok) {
@@ -1269,7 +1357,12 @@ static int find_image_url(const char *image_page_url, char *out, size_t outsz)
                     if (sscanf(d + 19, "%dx%d", &w, &hh) == 2) {
                         int meets_target = (w >= tw && hh >= th);
                         int meets_next   = (w >= nw && hh >= nh);
-                        if (meets_target && !meets_next) {
+                        /* отсекаем панорамные/ультраширокие (напр. 3840x1080),
+                         * оставляя близкие по соотношению сторон к выбранному тиру */
+                        double ta = th ? (double)tw / th : 1.777;
+                        double ar = hh ? (double)w / hh : ta;
+                        int aspect_ok = (ar >= ta / 1.5 && ar <= ta * 1.5);
+                        if (meets_target && !meets_next && aspect_ok) {
                             long area = (long)w * hh;
                             if (area > best) {   /* наибольшее в пределах тира */
                                 best = area; cw = w; ch = hh;
@@ -2517,6 +2610,41 @@ static void settings_relaunch(void)   /* пересоздать окно (для
     }
 }
 
+/* Пересобрать абсолютный save_dir из реестра и папку избранного. */
+static void rebuild_paths_from_reg(void)
+{
+    char raw[MAX_PATH] = ""; reg_get_str(L"save_dir", raw, sizeof(raw));
+    WCHAR wsave[MAX_PATH];
+    if (raw[0]) utf8_to_wide(raw, wsave, MAX_PATH); else wcscpy(wsave, L"GoodFon");
+    if (PathIsRelativeW(wsave)) {
+        WCHAR exedir[MAX_PATH], full[MAX_PATH];
+        GetModuleFileNameW(NULL, exedir, MAX_PATH); PathRemoveFileSpecW(exedir);
+        PathCombineW(full, exedir, wsave); wcscpy(wsave, full);
+    }
+    wide_to_utf8(wsave, g_cfg.save_dir, sizeof(g_cfg.save_dir));
+    WCHAR wtheme[64]; utf8_to_wide(g_cfg.theme, wtheme, 64);
+    wcscpy(g_favorite_dir, wsave);
+    PathAppendW(g_favorite_dir, L"Favorite");
+    PathAppendW(g_favorite_dir, wtheme);
+    SHCreateDirectoryExW(NULL, wsave, NULL);
+}
+
+/* Диалог выбора папки. Возвращает 1 и путь в out при успехе. */
+static int browse_folder(HWND owner, WCHAR *out, int outsz)
+{
+    BROWSEINFOW bi; ZeroMemory(&bi, sizeof(bi));
+    bi.hwndOwner = owner;
+    bi.lpszTitle = TW(L"Выберите папку для картинок", L"Choose images folder");
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return 0;
+    WCHAR path[MAX_PATH];
+    int ok = SHGetPathFromIDListW(pidl, path);
+    CoTaskMemFree(pidl);
+    if (ok) { wcsncpy(out, path, outsz - 1); out[outsz - 1] = 0; return 1; }
+    return 0;
+}
+
 static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -2655,8 +2783,41 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetTextColor((HDC)wp, cr_txt()); SetBkColor((HDC)wp, cr_bg());
         return (LRESULT)g_br_bg;
 
+    case WM_MEASUREITEM: {
+        LPMEASUREITEMSTRUCT m = (LPMEASUREITEMSTRUCT)lp;
+        if (m->CtlType == ODT_COMBOBOX) { m->itemHeight = 20; return TRUE; }
+        break;
+    }
+
     case WM_DRAWITEM: {
         LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
+        if (d->CtlType == ODT_COMBOBOX) {
+            if ((int)d->itemID < 0) return TRUE;
+            int isedit = (d->itemState & ODS_COMBOBOXEDIT) != 0;
+            int sel    = (d->itemState & ODS_SELECTED) != 0;
+            /* фон: поле выбора — cr_ctl; элемент списка — cr_bg, выделенный — cr_sel */
+            COLORREF bgc = isedit ? cr_ctl() : (sel ? cr_sel() : cr_bg());
+            HBRUSH bb = CreateSolidBrush(bgc);
+            FillRect(d->hDC, &d->rcItem, bb);
+            DeleteObject(bb);
+            WCHAR t[160]; SendMessageW(d->hwndItem, CB_GETLBTEXT, d->itemID, (LPARAM)t);
+            HFONT f = (HFONT)SendMessageW(d->hwndItem, WM_GETFONT, 0, 0);
+            HGDIOBJ of = f ? SelectObject(d->hDC, f) : NULL;
+            SetBkMode(d->hDC, TRANSPARENT);
+            SetTextColor(d->hDC, cr_txt());
+            RECT tr;
+            if (isedit) {   /* поле выбора: та же геометрия, что и в ComboSubProc */
+                GetClientRect(d->hwndItem, &tr);
+                tr.left  += 10;
+                tr.right -= (GetSystemMetrics(SM_CXVSCROLL) + 4);
+            } else {
+                tr = d->rcItem;
+                tr.left += 10;
+            }
+            DrawTextW(d->hDC, t, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (of) SelectObject(d->hDC, of);
+            return TRUE;
+        }
         if (d->CtlID == IDC_NAV) {
             if ((int)d->itemID < 0) return TRUE;
             int sel = (d->itemState & ODS_SELECTED) != 0;
@@ -2709,10 +2870,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
         HWND ctl = (HWND)lp;
-        /* после выбора/закрытия списка форсируем нашу перерисовку — иначе
-         * combobox дорисовывает текст своим смещением и он "прыгает". */
-        if (code == CBN_CLOSEUP || code == CBN_SELCHANGE)
-            InvalidateRect(ctl, NULL, TRUE);
+        /* после выбора значения — синхронно перерисовать комбобокс нашим
+         * ComboSubProc, чтобы текст не «съезжал» (owner-draw поля выбора) */
+        if (ctl && (code == CBN_SELCHANGE || code == CBN_CLOSEUP)) {
+            WCHAR cls[16]; GetClassNameW(ctl, cls, 16);
+            if (!lstrcmpiW(cls, L"COMBOBOX"))
+                RedrawWindow(ctl, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+        }
         if (id == IDC_NAV && code == LBN_SELCHANGE) {
             settings_set_page(h, (int)SendMessageW(ctl, LB_GETCURSEL, 0, 0));
         }
@@ -2747,6 +2911,35 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
             g_cfg.favorite_every_n = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
             reg_set_dword(L"favorite_every_n", g_cfg.favorite_every_n);
+        }
+        else if (id == IDC_CB_MAXFILES && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            int v = (int)SendMessageW(ctl, CB_GETITEMDATA, s, 0);
+            if (v > 0) {
+                g_cfg.max_files = v; reg_set_dword(L"max_files", v);
+                LOG_INFO(T("Хранить временных картинок: %d", "Keep temporary images: %d"), v);
+            }
+        }
+        else if (id == IDC_CB_SAVELOC && code == CBN_SELCHANGE) {
+            int s = (int)SendMessageW(ctl, CB_GETCURSEL, 0, 0);
+            if (s == 0) {
+                reg_set_str(L"save_dir", "GoodFon");
+                rebuild_paths_from_reg();
+            } else {
+                WCHAR folder[MAX_PATH];
+                if (browse_folder(h, folder, MAX_PATH)) {
+                    char f8[MAX_PATH * 3]; wide_to_utf8(folder, f8, sizeof(f8));
+                    reg_set_str(L"save_dir", f8);
+                    rebuild_paths_from_reg();
+                } else {
+                    char raw[MAX_PATH] = ""; reg_get_str(L"save_dir", raw, sizeof(raw));
+                    int custom = (raw[0] && _stricmp(raw, "GoodFon") != 0 && !PathIsRelativeA(raw));
+                    SendMessageW(ctl, CB_SETCURSEL, custom ? 1 : 0, 0);
+                }
+            }
+            WCHAR wsp[MAX_PATH]; utf8_to_wide(g_cfg.save_dir, wsp, MAX_PATH);
+            SetDlgItemTextW(h, IDC_ST_SAVEPATH, wsp);
+            LOG_INFO(T("Папка картинок: %s", "Images folder: %s"), g_cfg.save_dir);
         }
         else if (id == IDC_BTN_SIGNIN && code == BN_CLICKED) {
             char lg[128] = {0}, pw[128] = {0}; WCHAR w[128];
@@ -2915,7 +3108,7 @@ static void open_settings(void)
     /* ---- страница 0: Картинки ---- */
     y = 52;
     mk(h, L"STATIC", TW(L"Тема", L"Theme"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
-    HWND cbTheme = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+    HWND cbTheme = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
                       VX, y, VW, 240, IDC_CB_THEME, 0);
     { int order[THEME_COUNT];
       for (int i = 0; i < THEME_COUNT; i++) order[i] = i;
@@ -2933,7 +3126,7 @@ static void open_settings(void)
 
     y += 40;
     mk(h, L"STATIC", TW(L"Интервал смены", L"Change interval"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
-    HWND cbInt = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, VX, y, VW, 260, IDC_CB_INTERVAL, 0);
+    HWND cbInt = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, VX, y, VW, 260, IDC_CB_INTERVAL, 0);
     for (int i = 0; i < INTERVAL_COUNT; i++) {
         int v = g_intervals[i]; WCHAR t[32];
         if (v < 60)          _snwprintf(t, 32, TW(L"%d минут", L"%d min"), v);
@@ -2945,7 +3138,7 @@ static void open_settings(void)
 
     y += 40;
     mk(h, L"STATIC", TW(L"Разрешение", L"Resolution"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
-    HWND cbRes = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 200, IDC_CB_RES, 0);
+    HWND cbRes = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 200, IDC_CB_RES, 0);
     for (int i = 0; i < RES_COUNT; i++) {
         const WCHAR *rn = !strcmp(g_reses[i].value, "original")
                           ? TW(L"Оригинал (любое)", L"Original (any)") : g_reses[i].name;
@@ -2955,7 +3148,7 @@ static void open_settings(void)
 
     y += 40;
     mk(h, L"STATIC", TW(L"Из избранного", L"From favorites"), SS_LEFT, CX, y+4, 110, 20, 0, 0);
-    HWND cbFav = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 180, IDC_CB_FAVN, 0);
+    HWND cbFav = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 180, IDC_CB_FAVN, 0);
     cb_add(cbFav, TW(L"Без избранного", L"No favorites"), 0);
     if (g_cfg.favorite_every_n == 0) SendMessageW(cbFav, CB_SETCURSEL, 0, 0);
     for (int i = 0; i < FAVN_COUNT; i++) {
@@ -2963,6 +3156,31 @@ static void open_settings(void)
         cb_add(cbFav, t, g_favorite_ns[i]);
         if (g_cfg.favorite_every_n == g_favorite_ns[i]) SendMessageW(cbFav, CB_SETCURSEL, i + 1, 0);
     }
+
+    y += 40;
+    mk(h, L"STATIC", TW(L"Хранить временных", L"Keep temporary"), SS_LEFT, CX, y+4, 130, 20, 0, 0);
+    HWND cbMax = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 200, IDC_CB_MAXFILES, 0);
+    { static const int mx[] = { 5, 10, 20, 50, 100 };
+      for (int i = 0; i < 5; i++) {
+          WCHAR t[24]; _snwprintf(t, 24, TW(L"%d картинок", L"%d images"), mx[i]);
+          cb_add(cbMax, t, mx[i]);
+          if (g_cfg.max_files == mx[i]) SendMessageW(cbMax, CB_SETCURSEL, i, 0);
+      }
+      if (SendMessageW(cbMax, CB_GETCURSEL, 0, 0) == CB_ERR) SendMessageW(cbMax, CB_SETCURSEL, 1, 0);
+    }
+
+    y += 40;
+    mk(h, L"STATIC", TW(L"Папка картинок", L"Images folder"), SS_LEFT, CX, y+4, 130, 20, 0, 0);
+    HWND cbLoc = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 120, IDC_CB_SAVELOC, 0);
+    cb_add(cbLoc, TW(L"Рядом с приложением", L"Beside the app"), 0);
+    cb_add(cbLoc, TW(L"Указать папку…", L"Choose folder…"), 1);
+    { char raw[MAX_PATH] = ""; reg_get_str(L"save_dir", raw, sizeof(raw));
+      int custom = (raw[0] && _stricmp(raw, "GoodFon") != 0 && !PathIsRelativeA(raw));
+      SendMessageW(cbLoc, CB_SETCURSEL, custom ? 1 : 0, 0);
+    }
+    y += 34;
+    { WCHAR wsp[MAX_PATH]; utf8_to_wide(g_cfg.save_dir, wsp, MAX_PATH);
+      mk(h, L"STATIC", wsp, SS_LEFT | SS_PATHELLIPSIS, CX, y, VW + 120, 18, IDC_ST_SAVEPATH, 0); }
 
     /* ---- страница 1: Аккаунт ---- */
     /* сверху рисуется блок профиля (в WM_PAINT), поэтому авторизация — ниже */
@@ -2996,7 +3214,7 @@ static void open_settings(void)
        WS_TABSTOP | BS_AUTOCHECKBOX, CX, y, 360, 22, IDC_CHK_AUTORUN, 2);
     y += 34;
     mk(h, L"STATIC", TW(L"Домен сайта", L"Site domain"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
-    HWND cbDom = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 120, IDC_CB_DOMAIN, 2);
+    HWND cbDom = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 120, IDC_CB_DOMAIN, 2);
     cb_add(cbDom, TW(L"Авто", L"Auto"), 0);
     cb_add(cbDom, L".ru", 1);
     cb_add(cbDom, L".com", 2);
@@ -3004,17 +3222,17 @@ static void open_settings(void)
                  !strcmp(g_cfg.domain_pref, "ru") ? 1 : !strcmp(g_cfg.domain_pref, "com") ? 2 : 0, 0);
     y += 34;
     mk(h, L"STATIC", TW(L"Язык", L"Language"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
-    HWND cbLang = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 120, IDC_CB_LANG, 2);
+    HWND cbLang = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 120, IDC_CB_LANG, 2);
     cb_add(cbLang, L"Русский", 0); cb_add(cbLang, L"English", 1);
     SendMessageW(cbLang, CB_SETCURSEL, g_lang == LANG_EN ? 1 : 0, 0);
     y += 34;
     mk(h, L"STATIC", TW(L"Оформление", L"Appearance"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
-    HWND cbTh = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 120, IDC_CB_APPTHEME, 2);
+    HWND cbTh = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 120, IDC_CB_APPTHEME, 2);
     cb_add(cbTh, TW(L"Светлая", L"Light"), 0); cb_add(cbTh, TW(L"Тёмная", L"Dark"), 1);
     SendMessageW(cbTh, CB_SETCURSEL, g_ui_theme == THEME_DARK ? 1 : 0, 0);
     y += 34;
     mk(h, L"STATIC", TW(L"Автопроверка", L"Auto-update"), SS_LEFT, CX, y+4, 110, 20, 0, 2);
-    HWND cbUpd = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_TABSTOP, VX, y, VW, 160, IDC_CB_UPDINT, 2);
+    HWND cbUpd = mk(h, L"COMBOBOX", NULL, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP, VX, y, VW, 160, IDC_CB_UPDINT, 2);
     cb_add(cbUpd, TW(L"Выключена", L"Off"), 0);
     cb_add(cbUpd, TW(L"Раз в час", L"Hourly"), 60);
     cb_add(cbUpd, TW(L"Раз в день", L"Daily"), 1440);
