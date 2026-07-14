@@ -2316,7 +2316,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             /* копирайт снизу */
             SetTextColor(dc, g_ui_theme ? RGB(150,150,150) : RGB(110,110,110));
             RECT rc2; GetClientRect(h, &rc2);
-            RECT rcp = { x, rc2.bottom - 40, x + w, rc2.bottom - 8 };
+            RECT rcp = { x, rc2.bottom - 74, x + w, rc2.bottom - 50 };
             DrawTextW(dc, L"\u00A9 Mansi (slfl) \u00B7 slfl@mail.ru",
                       -1, &rcp, DT_LEFT | DT_SINGLELINE);
             SelectObject(dc, of);
@@ -2582,7 +2582,7 @@ static void open_settings(void)
     }
     theme_brushes_rebuild();
 
-    int W = 584, H = 348;
+    int W = 584, H = 400;
     RECT wr = { 0, 0, W, H };
     AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
@@ -2731,7 +2731,7 @@ static void open_settings(void)
     /* ---- страница 3: О приложении — текст рисуется в WM_PAINT (перенос по словам) ---- */
 
     mk(h, L"BUTTON", TW(L"Закрыть", L"Close"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-       464, 300, 100, 28, IDC_BTN_CLOSE, -1);
+       464, 360, 100, 28, IDC_BTN_CLOSE, -1);
 
     EnumChildWindows(h, subclass_combos_cb, 0);
     g_login_status = 0;
