@@ -4,8 +4,8 @@
 IDI_APPICON ICON "goodfon.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION     2,1,0,0
- PRODUCTVERSION  2,1,0,0
+ FILEVERSION     2,2,0,0
+ PRODUCTVERSION  2,2,0,0
  FILEFLAGSMASK   0x3fL
  FILEFLAGS       0x0L
  FILEOS          VOS_NT_WINDOWS32
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Mansi / slfl"
             VALUE "FileDescription",  "GoodFon - wallpaper changer"
-            VALUE "FileVersion",      "2.1.0.0"
+            VALUE "FileVersion",      "2.2.0.0"
             VALUE "InternalName",     "GoodFon"
             VALUE "LegalCopyright",   "Copyright (C) Mansi (slfl). All rights reserved."
             VALUE "OriginalFilename", "GoodFon.exe"
             VALUE "ProductName",      "GoodFon"
-            VALUE "ProductVersion",   "2.1.0.0"
+            VALUE "ProductVersion",   "2.2.0.0"
         END
     END
     BLOCK "VarFileInfo"

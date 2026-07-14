@@ -12,12 +12,13 @@
  *   - режимы CLI: GoodFon.exe update|favorite|unfavorite — разовый запуск без трея.
  *
  * Сборка (MSVC):  cmake -B build && cmake --build build --config Release
- * Линкуется с:    winhttp shell32 ole32 user32 advapi32 shlwapi gdi32
+ * Линкуется с:    winhttp shell32 ole32 user32 advapi32 shlwapi gdi32 windowscodecs
  * Кодировка:      исходник UTF-8; для MSVC включён /utf-8 в CMakeLists.
  */
 
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
+#define COBJMACROS
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
@@ -27,6 +28,7 @@
 #include <dpapi.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
+#include <wincodec.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +38,7 @@
 /* ================= Константы ================= */
 
 #define APP_NAME        L"GoodFon"
-#define APP_VERSION     "2.1"
+#define APP_VERSION     "2.2"
 #define WM_TRAYICON     (WM_APP + 1)
 #define TIMER_ID        1
 #define UPD_TIMER_ID    2
@@ -236,6 +238,18 @@ static HWND  g_set_hwnd = NULL;         /* окно настроек (объяв
 static int   g_update_status = 0;       /* 0 нет, 1 проверка, 2 актуально, 3 ставится, 4 ошибка */
 #define WM_APP_LOGINRESULT  (WM_APP + 3)
 #define WM_APP_UPDATERESULT (WM_APP + 4)
+#define WM_APP_STATS        (WM_APP + 5)
+
+/* Профильная статистика с сайта (для страницы "Аккаунт"). */
+typedef struct {
+    int     valid;            /* 1 если загружена с сайта */
+    char    rating[16];       /* напр. "5.00" */
+    long    walls, downloads, comments;
+    char    avatar_url[256];  /* полный URL .webp */
+    HBITMAP avatar_bmp;       /* декодированная 32x32 (или NULL) */
+} ProfileStats;
+static ProfileStats g_stats;
+static void stats_refresh_async(void);   /* fwd: нужен worker_thread'у */
 static HINSTANCE g_hinst;
 static NOTIFYICONDATAW g_nid;
 static volatile LONG g_busy = 0;
@@ -1885,6 +1899,7 @@ static DWORD WINAPI worker_thread(LPVOID param)
                 LOG_INFO(T("Авторизация через меню успешна.", "Sign-in from menu successful."));
                 notify_user(L"GoodFon", TW(L"Авторизация успешна.", L"Authorization successful."));
                 if (g_set_hwnd) PostMessageW(g_set_hwnd, WM_APP_LOGINRESULT, 1, 0);
+                stats_refresh_async();
             } else {
                 LOG_WARN(T("Авторизация через меню не удалась (проверьте логин и пароль).", "Sign-in from menu failed (check login and password)."));
                 notify_user(L"GoodFon", TW(L"Не удалось войти: проверьте логин и пароль.", L"Sign-in failed: check login and password."));
@@ -1925,6 +1940,7 @@ static DWORD WINAPI startup_thread(LPVOID param)
 /* Открыть страницу регистрации сайта в браузере (в приложении нельзя из-за
  * reCAPTCHA на форме регистрации). */
 static void select_theme(int idx);   /* fwd */
+static void stats_clear(void);        /* fwd */
 
 /* Быстрый некриптографический хэш файла (FNV-1a 64) — для сравнения exe. */
 static unsigned long long hash_file(const WCHAR *path)
@@ -2078,6 +2094,243 @@ static void account_logout(void)
 
     LOG_INFO(T("Выход из аккаунта: локальные учётные данные и кэш сессий очищены.", "Signed out: local credentials and session cache cleared."));
     notify_user(L"GoodFon", TW(L"Выход из аккаунта выполнен.", L"Signed out."));
+
+    stats_clear();
+    { HKEY k = reg_open(KEY_WRITE); if (k) { RegDeleteValueW(k, L"profile_stats"); RegCloseKey(k); } }
+}
+
+/* ===================== Профильная статистика ===================== */
+
+static void stats_clear(void)
+{
+    if (g_stats.avatar_bmp) { DeleteObject(g_stats.avatar_bmp); g_stats.avatar_bmp = NULL; }
+    memset(&g_stats, 0, sizeof(g_stats));
+}
+
+static void stats_save_reg(void)
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s|%ld|%ld|%ld|%s",
+             g_stats.rating[0] ? g_stats.rating : "0",
+             g_stats.walls, g_stats.downloads, g_stats.comments, g_stats.avatar_url);
+    reg_set_str(L"profile_stats", buf);
+}
+
+static void stats_load_reg(void)
+{
+    char buf[512];
+    if (!reg_get_str(L"profile_stats", buf, sizeof(buf)) || !buf[0]) return;
+    char *ctx = NULL;
+    char *r = strtok_s(buf, "|", &ctx);
+    char *w = strtok_s(NULL, "|", &ctx);
+    char *d = strtok_s(NULL, "|", &ctx);
+    char *c = strtok_s(NULL, "|", &ctx);
+    char *a = strtok_s(NULL, "|", &ctx);
+    if (r) { strncpy(g_stats.rating, r, sizeof(g_stats.rating) - 1); g_stats.rating[sizeof(g_stats.rating)-1]=0; }
+    g_stats.walls     = w ? atol(w) : 0;
+    g_stats.downloads = d ? atol(d) : 0;
+    g_stats.comments  = c ? atol(c) : 0;
+    if (a) { strncpy(g_stats.avatar_url, a, sizeof(g_stats.avatar_url) - 1); g_stats.avatar_url[sizeof(g_stats.avatar_url)-1]=0; }
+    g_stats.valid = 1;
+}
+
+/* Декодировать изображение (любой формат, поддержанный WIC, вкл. webp) в HBITMAP w×h. */
+static HBITMAP load_image_hbitmap(const WCHAR *path, int W, int H)
+{
+    HBITMAP hbmp = NULL;
+    IWICImagingFactory   *fac = NULL;
+    IWICBitmapDecoder    *dec = NULL;
+    IWICBitmapFrameDecode*frm = NULL;
+    IWICBitmapScaler     *scl = NULL;
+    IWICFormatConverter  *cnv = NULL;
+
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IWICImagingFactory, (void **)&fac)))
+        return NULL;
+    if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(fac, path, NULL, GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand, &dec))) goto done;
+    if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &frm))) goto done;
+    if (FAILED(IWICImagingFactory_CreateBitmapScaler(fac, &scl))) goto done;
+    if (FAILED(IWICBitmapScaler_Initialize(scl, (IWICBitmapSource *)frm, W, H,
+                WICBitmapInterpolationModeFant))) goto done;
+    if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cnv))) goto done;
+    if (FAILED(IWICFormatConverter_Initialize(cnv, (IWICBitmapSource *)scl,
+                &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0,
+                WICBitmapPaletteTypeCustom))) goto done;
+    {
+        BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void *bits = NULL;
+        HDC hdc = GetDC(NULL);
+        hbmp = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        ReleaseDC(NULL, hdc);
+        if (hbmp && bits) {
+            if (FAILED(IWICFormatConverter_CopyPixels(cnv, NULL, W * 4, W * 4 * H, (BYTE *)bits))) {
+                DeleteObject(hbmp); hbmp = NULL;
+            }
+        }
+    }
+done:
+    if (cnv) IWICFormatConverter_Release(cnv);
+    if (scl) IWICBitmapScaler_Release(scl);
+    if (frm) IWICBitmapFrameDecode_Release(frm);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    if (fac) IWICImagingFactory_Release(fac);
+    return hbmp;
+}
+
+/* Извлечь URL аватара рядом с якорным классом (в пределах окна),
+ * терпит кавычки, url(), протокол-относительные // и экранированные \/. */
+static void extract_avatar_near(const char *anchor, const char *base_body,
+                                char *out, size_t outsz)
+{
+    (void)base_body;
+    if (!anchor || out[0]) return;
+    const char *a = strstr(anchor, "avatars");
+    if (!a || (a - anchor) > 400) return;          /* только рядом с якорем */
+    const char *s = a;
+    while (s > anchor && *s != '"' && *s != '\'' && *s != '(' && *s != ' ' && *s != '=') s--;
+    s++;
+    char raw[300]; int n = 0; const char *e = s;
+    while (*e && *e != '"' && *e != '\'' && *e != ')' && *e != ' ' && *e != '>'
+           && *e != '\r' && *e != '\n' && n < 299) {
+        if (e[0] == '\\' && e[1] == '/') { raw[n++] = '/'; e += 2; }
+        else raw[n++] = *e++;
+    }
+    raw[n] = 0;
+    if (strncmp(raw, "//", 2) == 0)      snprintf(out, outsz, "https:%s", raw);
+    else if (raw[0] == '/')              snprintf(out, outsz, "https://img.goodfon.com%s", raw);
+    else { strncpy(out, raw, outsz - 1); out[outsz - 1] = 0; }
+}
+
+/* Считать число из строки, пропуская пробелы-разделители тысяч: "119 236" -> 119236. */
+static long parse_grouped_number(const char *p)
+{
+    long v = 0;
+    while (*p && (*p == ' ' || (*p >= '0' && *p <= '9'))) {
+        if (*p >= '0' && *p <= '9') v = v * 10 + (*p - '0');
+        p++;
+    }
+    return v;
+}
+
+/* Загрузить и разобрать блок статистики с профиля. Возвращает 1 при успехе. */
+static int fetch_profile_stats(void)
+{
+    if (!is_authorized() || !g_cfg.login[0]) return 0;
+
+    char base[64]; base_url(base, sizeof(base));
+    char url[160];
+    HttpResp r; memset(&r, 0, sizeof(r));
+    const char *blk = NULL;
+
+    /* Полный блок профиля (аватар/рейтинг/счётчики) есть на странице избранного;
+     * пустая страница /user/<login>/ его может не содержать. */
+    snprintf(url, sizeof(url), "%s/user/%s/favorite/", base, g_cfg.login);
+    if (http_request("GET", url, NULL, NULL, 30000, BODY_LIMIT, &r) && r.body)
+        blk = strstr(r.body, "user_stat_block");
+    if (!blk) {
+        free(r.body); memset(&r, 0, sizeof(r));
+        snprintf(url, sizeof(url), "%s/user/%s/", base, g_cfg.login);
+        if (http_request("GET", url, NULL, NULL, 30000, BODY_LIMIT, &r) && r.body)
+            blk = strstr(r.body, "user_stat_block");
+    }
+    if (!blk) { free(r.body); LOG_WARN(T("Статистика: блок user_stat_block не найден в HTML.",
+                                          "Stats: user_stat_block not found in HTML.")); return 0; }
+    LOG_INFO(T("Статистика: блок найден на %s", "Stats: block found at %s"), url);
+
+    ProfileStats ns; memset(&ns, 0, sizeof(ns));
+    strcpy(ns.rating, "0");
+
+    /* аватарка: сначала по классу шапки headline__user__avatar (это всегда
+     * текущий пользователь), затем по class="avatar" внутри блока профиля */
+    {
+        extract_avatar_near(strstr(r.body, "headline__user__avatar"), r.body,
+                            ns.avatar_url, sizeof(ns.avatar_url));
+        if (!ns.avatar_url[0])
+            extract_avatar_near(strstr(blk, "class=\"avatar\""), r.body,
+                                ns.avatar_url, sizeof(ns.avatar_url));
+        if (!ns.avatar_url[0])
+            LOG_INFO(T("Аватар: URL не найден по классам (грузится через JS?).",
+                       "Avatar: URL not found by class (JS-loaded?)."));
+    }
+    /* рейтинг: "рейтинг 5.00" (RU) или "rating 5.00" (COM) */
+    const char *rt = strstr(blk, "\xD1\x80\xD0\xB5\xD0\xB9\xD1\x82\xD0\xB8\xD0\xBD\xD0\xB3"); /* "рейтинг" */
+    int mlen = 14;
+    if (!rt) { rt = strstr(blk, "rating"); mlen = 6; }
+    if (rt) {
+        rt += mlen;
+        int guard = 0;
+        while (*rt && !(*rt >= '0' && *rt <= '9') && guard < 48) { rt++; guard++; }
+        int i = 0;
+        while (*rt && ((*rt >= '0' && *rt <= '9') || *rt == '.') && i < 15) ns.rating[i++] = *rt++;
+        ns.rating[i] = 0;
+        if (!ns.rating[0]) strcpy(ns.rating, "0");
+    }
+    /* нижний блок: обоев / скачиваний / комментариев */
+    const char *bot = strstr(blk, "user_stat_block__bottom");
+    if (bot) {
+        const char *q = bot; long *dst[3] = { &ns.walls, &ns.downloads, &ns.comments };
+        for (int i = 0; i < 3; i++) {
+            q = strstr(q, "<div>");
+            if (!q) break;
+            q += 5;
+            *dst[i] = parse_grouped_number(q);
+        }
+    }
+    free(r.body);
+
+    /* аватарку скачиваем и декодируем */
+    HBITMAP bmp = NULL;
+    if (ns.avatar_url[0]) {
+        WCHAR self[MAX_PATH]; GetModuleFileNameW(NULL, self, MAX_PATH);
+        WCHAR dir[MAX_PATH]; wcscpy(dir, self); PathRemoveFileSpecW(dir);
+        WCHAR af[MAX_PATH];  PathCombineW(af, dir, L"avatar.img");
+        WCHAR wurl[512]; utf8_to_wide(ns.avatar_url, wurl, 512);
+        if (fetch_url_raw(wurl, af, NULL, 0)) {
+            bmp = load_image_hbitmap(af, 32, 32);
+            LOG_INFO(bmp ? T("Аватар декодирован: %s", "Avatar decoded: %s")
+                         : T("Аватар не декодировался (нет WebP-кодека?): %s",
+                             "Avatar decode failed (no WebP codec?): %s"), ns.avatar_url);
+        } else {
+            LOG_WARN(T("Аватар: не удалось скачать %s", "Avatar: download failed %s"), ns.avatar_url);
+        }
+        DeleteFileW(af);
+    } else {
+        LOG_INFO(T("Аватар: URL в блоке профиля не найден.", "Avatar: URL not found in profile block."));
+    }
+
+    ns.avatar_bmp = bmp;
+    ns.valid = 1;
+
+    /* заменяем глобальную статистику (старый bmp освобождаем) */
+    HBITMAP old = g_stats.avatar_bmp;
+    g_stats = ns;
+    if (old && old != bmp) DeleteObject(old);
+
+    stats_save_reg();
+    LOG_INFO(T("Статистика профиля обновлена: рейтинг %s, обоев %ld, скачиваний %ld, комментариев %ld",
+               "Profile stats updated: rating %s, wallpapers %ld, downloads %ld, comments %ld"),
+             g_stats.rating, g_stats.walls, g_stats.downloads, g_stats.comments);
+    return 1;
+}
+
+static DWORD WINAPI stats_thread(LPVOID p)
+{
+    (void)p;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    int ok = fetch_profile_stats();
+    CoUninitialize();
+    if (ok && g_set_hwnd) PostMessageW(g_set_hwnd, WM_APP_STATS, 0, 0);
+    return 0;
+}
+static void stats_refresh_async(void)
+{
+    HANDLE t = CreateThread(NULL, 0, stats_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
 }
 
 /* ================= Трей и меню ================= */
@@ -2285,6 +2538,51 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 SelectObject(dc, ob); SelectObject(dc, op);
                 DeleteObject(bg); DeleteObject(pen);
             }
+            /* ----- блок профильной статистики (сверху страницы) ----- */
+            {
+                int x = 186, y = 56, w = 372;
+                /* аватарка 32x32: с сайта или иконка приложения */
+                if (g_stats.avatar_bmp) {
+                    HDC mdc = CreateCompatibleDC(dc);
+                    HGDIOBJ ob = SelectObject(mdc, g_stats.avatar_bmp);
+                    BitBlt(dc, x, y, 32, 32, mdc, 0, 0, SRCCOPY);
+                    SelectObject(mdc, ob); DeleteDC(mdc);
+                } else if (g_nid.hIcon) {
+                    DrawIconEx(dc, x, y, g_nid.hIcon, 32, 32, 0, NULL, DI_NORMAL);
+                }
+
+                SetBkMode(dc, TRANSPARENT);
+                /* имя пользователя */
+                HGDIOBJ of = SelectObject(dc, g_set_font);
+                SetTextColor(dc, cr_txt());
+                WCHAR nm[130];
+                if (is_authorized() && g_cfg.login[0]) utf8_to_wide(g_cfg.login, nm, 130);
+                else wcscpy(nm, TW(L"Не выполнен вход", L"Not signed in"));
+                RECT rn = { x + 44, y, x + w, y + 16 };
+                DrawTextW(dc, nm, -1, &rn, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+                /* рейтинг */
+                SetTextColor(dc, g_ui_theme ? RGB(150,150,150) : RGB(110,110,110));
+                WCHAR rr[48];
+                _snwprintf(rr, 48, TW(L"рейтинг %hs", L"rating %hs"),
+                           g_stats.valid && g_stats.rating[0] ? g_stats.rating : "0");
+                RECT rrt = { x + 44, y + 16, x + w, y + 32 };
+                DrawTextW(dc, rr, -1, &rrt, DT_LEFT | DT_SINGLELINE);
+                /* счётчики */
+                SetTextColor(dc, cr_txt());
+                WCHAR cnt[160];
+                _snwprintf(cnt, 160, TW(L"%ld обоев      %ld скачиваний      %ld комментариев",
+                                        L"%ld wallpapers      %ld downloads      %ld comments"),
+                           g_stats.walls, g_stats.downloads, g_stats.comments);
+                RECT rc3 = { x, y + 44, x + w, y + 62 };
+                DrawTextW(dc, cnt, -1, &rc3, DT_LEFT | DT_SINGLELINE);
+                SelectObject(dc, of);
+
+                /* разделитель под блоком (перед авторизацией) */
+                HPEN sp = CreatePen(PS_SOLID, 1, cr_border());
+                HGDIOBJ osp = SelectObject(dc, sp);
+                MoveToEx(dc, x, y + 84, NULL); LineTo(dc, x + w, y + 84);
+                SelectObject(dc, osp); DeleteObject(sp);
+            }
         }
         else if (g_set_page == 3) {
             SetBkMode(dc, TRANSPARENT);
@@ -2293,7 +2591,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             HGDIOBJ of = SelectObject(dc, g_set_font_title);
             SetTextColor(dc, cr_txt());
             RECT rt = { x, y, x + w, y + 26 };
-            DrawTextW(dc, L"GoodFon 2.1", -1, &rt, DT_LEFT | DT_SINGLELINE);
+            DrawTextW(dc, L"GoodFon 2.2", -1, &rt, DT_LEFT | DT_SINGLELINE);
             y += 34;
             /* описание с переносом по словам */
             SelectObject(dc, g_set_font);
@@ -2528,6 +2826,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_APP_STATS:
+        if (g_set_page == 1) InvalidateRect(h, NULL, TRUE);
+        return 0;
     case WM_APP_UPDATERESULT: {
         g_update_status = (int)wp;
         HWND st = GetDlgItem(h, IDC_ST_UPDATE);
@@ -2664,11 +2965,12 @@ static void open_settings(void)
     }
 
     /* ---- страница 1: Аккаунт ---- */
+    /* сверху рисуется блок профиля (в WM_PAINT), поэтому авторизация — ниже */
     WCHAR wlog[128]; utf8_to_wide(g_cfg.login, wlog, 128);
     WCHAR wpw[128];  utf8_to_wide(g_cfg.password, wpw, 128);
     int authed0 = is_authorized();
     const int EH = 20;   /* высота поля (невысокое — EDIT центрирует текст сам) */
-    y = 52;
+    y = 168;
     mk(h, L"STATIC", TW(L"Логин", L"Login"), SS_LEFT, CX, y+4, 110, 20, 0, 1);
     HWND edLog = mk(h, L"EDIT", (g_cfg.login[0] && strcmp(g_cfg.login,"your_login")) ? wlog : L"",
        WS_TABSTOP | ES_AUTOHSCROLL, VX+8, y+4, VW-16, EH, IDC_ED_LOGIN, 1);
@@ -2736,6 +3038,12 @@ static void open_settings(void)
     EnumChildWindows(h, subclass_combos_cb, 0);
     g_login_status = 0;
     g_update_status = 0;
+    if (is_authorized()) {
+        if (!g_stats.valid) stats_load_reg();   /* показать кэш сразу */
+        stats_refresh_async();                  /* обновить с сайта в фоне */
+    } else {
+        stats_clear();                          /* нули + иконка приложения */
+    }
     settings_apply_theme(h);
     settings_set_page(h, 0);
     ShowWindow(h, SW_SHOW);
@@ -2925,6 +3233,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdline, int show)
     LocalFree(argv);
 
     log_open(debug);         /* без -debug логи не создаются вообще */
+    LOG_INFO(T("GoodFon %s запущен (сборка %s %s)", "GoodFon %s started (build %s %s)"),
+             APP_VERSION, __DATE__, __TIME__);
     settings_load();         /* из реестра */
     enable_dark_mode_app(g_ui_theme);   /* тёмный режим приложения по сохранённой теме */
 
