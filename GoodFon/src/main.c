@@ -112,6 +112,7 @@ static void theme_brushes_rebuild(void)
 #define IDC_CB_DOMAIN   3018
 #define IDC_ST_STATUS   3019
 #define IDC_CB_UPDINT   3020
+#define IDC_ST_UPDATE   3021
 
 #define MAX_THEMES      64
 #define JAR_SIZE        4096
@@ -232,7 +233,9 @@ static const char *g_hosts[2] = { "www.goodfon.com", "www.goodfon.ru" };
 /* Трей / состояние */
 static HWND  g_hwnd;
 static HWND  g_set_hwnd = NULL;         /* окно настроек (объявлено рано: нужно worker'у) */
-#define WM_APP_LOGINRESULT (WM_APP + 3)
+static int   g_update_status = 0;       /* 0 нет, 1 проверка, 2 актуально, 3 ставится, 4 ошибка */
+#define WM_APP_LOGINRESULT  (WM_APP + 3)
+#define WM_APP_UPDATERESULT (WM_APP + 4)
 static HINSTANCE g_hinst;
 static NOTIFYICONDATAW g_nid;
 static volatile LONG g_busy = 0;
@@ -1941,15 +1944,23 @@ static unsigned long long hash_file(const WCHAR *path)
 /* Проверка и установка обновления по ХЭШУ exe: качаем удалённый exe во временный
  * файл, сравниваем его хэш с текущим. Совпал — уже актуально; разошёлся — ставим.
  * Замена работающего файла: self -> <exe>.old, апдейт -> self, запуск, выход. */
+static void upd_status(int code)
+{
+    g_update_status = code;
+    if (g_set_hwnd) PostMessageW(g_set_hwnd, WM_APP_UPDATERESULT, code, 0);
+}
+
 static void check_update(int silent)
 {
     WCHAR self[MAX_PATH]; GetModuleFileNameW(NULL, self, MAX_PATH);
     WCHAR dir[MAX_PATH];  wcscpy(dir, self); PathRemoveFileSpecW(dir);
     WCHAR upd[MAX_PATH];  PathCombineW(upd, dir, L"GoodFon-update.exe");
 
+    upd_status(1);   /* проверяю */
     if (!silent) notify_user(APP_NAME, TW(L"Проверяю обновления…", L"Checking for updates…"));
 
     if (!fetch_url_raw(UPDATE_EXE_URL, upd, NULL, 0)) {
+        upd_status(4);
         LOG_WARN(T("Обновление: не удалось скачать exe с GitHub.",
                    "Update: failed to download exe from GitHub."));
         if (!silent) notify_user(APP_NAME,
@@ -1970,6 +1981,7 @@ static void check_update(int silent)
         if (rd == 2 && mz[0] == 'M' && mz[1] == 'Z' && sz.QuadPart > 50000) valid = 1;
     }
     if (!valid) {
+        upd_status(4);
         LOG_WARN(T("Обновление: скачанный файл не похож на exe, отмена.",
                    "Update: downloaded file is not a valid exe, aborting."));
         if (!silent) notify_user(APP_NAME,
@@ -1986,12 +1998,14 @@ static void check_update(int silent)
              (unsigned long)(h_new  >> 32), (unsigned long)h_new);
 
     if (h_new == 0) {   /* не смогли прочитать скачанный файл */
+        upd_status(4);
         if (!silent) notify_user(APP_NAME,
             TW(L"Не удалось проверить обновления.", L"Failed to check for updates."));
         DeleteFileW(upd);
         return;
     }
     if (h_self == h_new) {          /* байт-в-байт совпадает — обновлять нечего */
+        upd_status(2);
         DeleteFileW(upd);
         LOG_INFO(T("Обновлений нет: версия совпадает.", "No updates: version matches."));
         if (!silent) notify_user(APP_NAME,
@@ -2015,6 +2029,7 @@ static void check_update(int silent)
     }
 
     LOG_INFO(T("Обновление установлено, перезапуск.", "Update installed, restarting."));
+    upd_status(3);
     notify_user(APP_NAME, TW(L"Обновление установлено, перезапуск…",
                              L"Update installed, restarting…"));
     ShellExecuteW(NULL, L"open", self, NULL, dir, SW_SHOWNORMAL);
@@ -2271,6 +2286,41 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 DeleteObject(bg); DeleteObject(pen);
             }
         }
+        else if (g_set_page == 3) {
+            SetBkMode(dc, TRANSPARENT);
+            int x = 186, w = 372, y = 52;
+            /* название */
+            HGDIOBJ of = SelectObject(dc, g_set_font_title);
+            SetTextColor(dc, cr_txt());
+            RECT rt = { x, y, x + w, y + 26 };
+            DrawTextW(dc, L"GoodFon 2.1", -1, &rt, DT_LEFT | DT_SINGLELINE);
+            y += 34;
+            /* описание с переносом по словам */
+            SelectObject(dc, g_set_font);
+            const WCHAR *desc = TW(
+                L"Автоматически меняет обои рабочего стола, подбирая изображения "
+                L"с сайта goodfon.com / goodfon.ru по выбранным теме и разрешению.\r\n\r\n"
+                L"Умеет добавлять понравившиеся обои в избранное и синхронизировать "
+                L"его с вашим аккаунтом на сайте, работает по заданному интервалу, "
+                L"живёт в системном трее и потребляет минимум ресурсов.\r\n\r\n"
+                L"Написано на чистом C (WinAPI), без сторонних библиотек.",
+                L"Automatically changes your desktop wallpaper, picking images from "
+                L"goodfon.com / goodfon.ru by the chosen theme and resolution.\r\n\r\n"
+                L"Can add favorite wallpapers and sync them with your account on the "
+                L"site, runs on a set interval, lives in the system tray and uses "
+                L"minimal resources.\r\n\r\n"
+                L"Written in pure C (WinAPI), with no third-party libraries.");
+            SetTextColor(dc, cr_txt());
+            RECT rd = { x, y, x + w, y + 150 };
+            DrawTextW(dc, desc, -1, &rd, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            /* копирайт снизу */
+            SetTextColor(dc, g_ui_theme ? RGB(150,150,150) : RGB(110,110,110));
+            RECT rc2; GetClientRect(h, &rc2);
+            RECT rcp = { x, rc2.bottom - 40, x + w, rc2.bottom - 8 };
+            DrawTextW(dc, L"\u00A9 Mansi (slfl) \u00B7 slfl@mail.ru",
+                      -1, &rcp, DT_LEFT | DT_SINGLELINE);
+            SelectObject(dc, of);
+        }
         EndPaint(h, &ps);
         return 0;
     }
@@ -2294,6 +2344,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (cid == IDC_ST_STATUS)
             SetTextColor(dc, g_login_status == 1 ? RGB(40,170,80)
                            : g_login_status == 2 ? RGB(220,70,70) : cr_txt());
+        else if (cid == IDC_ST_UPDATE)
+            SetTextColor(dc, g_update_status == 2 || g_update_status == 3 ? RGB(40,170,80)
+                           : g_update_status == 4 ? RGB(220,70,70) : cr_txt());
         else
             SetTextColor(dc, cid == IDC_LNK_REG ? cr_accent() : cr_txt());
         SetBkColor(dc, cr_bg());
@@ -2358,6 +2411,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
         HWND ctl = (HWND)lp;
+        /* после выбора/закрытия списка форсируем нашу перерисовку — иначе
+         * combobox дорисовывает текст своим смещением и он "прыгает". */
+        if (code == CBN_CLOSEUP || code == CBN_SELCHANGE)
+            InvalidateRect(ctl, NULL, TRUE);
         if (id == IDC_NAV && code == LBN_SELCHANGE) {
             settings_set_page(h, (int)SendMessageW(ctl, LB_GETCURSEL, 0, 0));
         }
@@ -2471,6 +2528,18 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_APP_UPDATERESULT: {
+        g_update_status = (int)wp;
+        HWND st = GetDlgItem(h, IDC_ST_UPDATE);
+        const WCHAR *txt =
+            g_update_status == 1 ? TW(L"Проверяю обновления…", L"Checking for updates…") :
+            g_update_status == 2 ? TW(L"У вас последняя версия.", L"You have the latest version.") :
+            g_update_status == 3 ? TW(L"Найдено обновление, устанавливаю…", L"Update found, installing…") :
+            g_update_status == 4 ? TW(L"Не удалось проверить (сайт недоступен?).", L"Check failed (site unavailable?).") : L"";
+        SetWindowTextW(st, txt);
+        InvalidateRect(st, NULL, TRUE);
+        return 0;
+    }
     case WM_APP_LOGINRESULT: {
         g_login_status = (int)wp;   /* 1 успех, 2 ошибка */
         HWND st = GetDlgItem(h, IDC_ST_STATUS);
@@ -2482,7 +2551,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_CLOSE: DestroyWindow(h); return 0;
-    case WM_DESTROY: g_set_hwnd = NULL; g_login_status = 0; return 0;
+    case WM_DESTROY: g_set_hwnd = NULL; g_login_status = 0; g_update_status = 0; return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
@@ -2654,29 +2723,19 @@ static void open_settings(void)
     y += 36;
     mk(h, L"BUTTON", TW(L"Проверить обновления", L"Check for updates"),
        WS_TABSTOP | BS_OWNERDRAW, VX, y, 200, 28, IDC_BTN_UPDATE, 2);
+    mk(h, L"STATIC", L"", SS_LEFT, VX, y + 32, 250, 34, IDC_ST_UPDATE, 2);
 
     SendMessageW(GetDlgItem(h, IDC_CHK_NOTIFY),  BM_SETCHECK, g_cfg.notify ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(GetDlgItem(h, IDC_CHK_AUTORUN), BM_SETCHECK, autostart_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    /* ---- страница 3: О приложении ---- */
-    mk(h, L"STATIC",
-       TW(L"GoodFon — автоматическая смена обоев рабочего стола.\r\n\r\n"
-          L"Скачивает картинки с goodfon.com / goodfon.ru по выбранной теме и "
-          L"разрешению, умеет добавлять обои в избранное и синхронизировать его "
-          L"с вашим аккаунтом на сайте.",
-          L"GoodFon — automatic desktop wallpaper changer.\r\n\r\n"
-          L"Downloads images from goodfon.com / goodfon.ru by the chosen theme and "
-          L"resolution, can add wallpapers to favorites and sync them with your "
-          L"account on the site."),
-       SS_LEFT, CX, 52, 372, 110, 0, 3);
-    mk(h, L"STATIC", TW(L"Версия 2.1", L"Version 2.1"), SS_LEFT, CX, 224, 372, 20, 0, 3);
-    mk(h, L"STATIC", L"\u00A9 Mansi (slfl) \u00B7 slfl@mail.ru", SS_LEFT, CX, 248, 372, 20, 0, 3);
+    /* ---- страница 3: О приложении — текст рисуется в WM_PAINT (перенос по словам) ---- */
 
     mk(h, L"BUTTON", TW(L"Закрыть", L"Close"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
        464, 300, 100, 28, IDC_BTN_CLOSE, -1);
 
     EnumChildWindows(h, subclass_combos_cb, 0);
     g_login_status = 0;
+    g_update_status = 0;
     settings_apply_theme(h);
     settings_set_page(h, 0);
     ShowWindow(h, SW_SHOW);
@@ -2718,7 +2777,6 @@ static void show_menu(void)
     menu_add(m, TW(L"Пауза", L"Pause"), IDM_PAUSE, g_paused, 0);
     menu_add(m, TW(L"Настройки", L"Settings"), IDM_SETTINGS, 0, 0);
     menu_sep(m);
-    menu_add(m, L"By Mansi / slfl@mail.ru", 0, 0, 1);
     menu_add(m, TW(L"Выход", L"Exit"), IDM_EXIT, 0, 0);
 
     HBRUSH menubg = CreateSolidBrush(cr_bg());
