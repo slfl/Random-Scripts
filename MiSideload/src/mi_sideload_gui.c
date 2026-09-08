@@ -82,6 +82,7 @@ static const unsigned char OTA_IV[16]  = "0102030405060708";
 #define WM_APP_PROG   (WM_APP + 2)
 #define WM_APP_DONE   (WM_APP + 3)
 #define WM_APP_STATUS (WM_APP + 4)
+#define WM_APP_RESULTS (WM_APP + 5)
 
 /* child control ids */
 #define IDC_LOG      1001
@@ -106,6 +107,14 @@ static const unsigned char OTA_IV[16]  = "0102030405060708";
 #define IDM_SET_GENTLE 2022
 #define IDM_LANG_RU   2030
 #define IDM_LANG_EN   2031
+#define IDM_FW_MIUIER 2040
+#define IDM_FW_EZBOX  2041
+#define IDM_FW_SEARCH 2042
+#define IDM_FW_PAUSE  2043
+#define IDM_FW_STOP   2044
+#define IDD_SEARCH       100
+#define IDC_SEARCH_EDIT  101
+#define IDD_RESULTS      110
 
 /* ------------------------------------------------------------------- globals */
 static HWND g_main, g_log, g_prog, g_status, g_footer;
@@ -139,6 +148,9 @@ enum {
     S_OPEN, S_INFO, S_SERVER, S_DOWNLOADS, S_START, S_ABOUT, S_EXIT,
     S_ADB_SET, S_ADB_RESET, S_ADB_CHECK, S_ADB_KILL,
     S_SET_WIPE, S_SET_LOGS, S_SET_GENTLE, S_LANG, S_LANG_RU, S_LANG_EN,
+    S_FW_MENU, S_FW_MIUIER, S_FW_EZBOX, S_FW_SEARCH, S_FW_PAUSE, S_FW_STOP,
+    S_FW_DLG_TITLE, S_FW_DLG_LABEL,
+    S_FW_RESULTS_TITLE, S_FW_CHOOSE, S_FW_SOURCE, S_FW_DL_BTN, S_FW_CANCEL,
     S_READY, S_NOFW, S_FW, S_ADBPATH_DEFAULT,
     S_ST_READY, S_ST_CONNECTING, S_ST_INFO, S_ST_TOKEN, S_ST_WIPE,
     S_ST_FLASHING, S_ST_DONE, S_ST_NOTCONN, S_ST_BUSY, S_ST_NODEV, S_ST_DEVREADY,
@@ -169,6 +181,20 @@ static const char *STR[S_COUNT][2] = {
 [S_LANG]         = {"Язык", "Language"},
 [S_LANG_RU]      = {"Русский", "Russian"},
 [S_LANG_EN]      = {"English", "English"},
+[S_FW_MENU]      = {"Прошивки", "Firmware"},
+[S_FW_MIUIER]    = {"Открыть MIUI Roms", "Open MIUI Roms"},
+[S_FW_EZBOX]     = {"Открыть MIUI Ezbox", "Open MIUI Ezbox"},
+[S_FW_SEARCH]    = {"Поиск прошивки…", "Search firmware…"},
+[S_FW_PAUSE]     = {"Пауза / продолжить загрузку", "Pause / resume download"},
+[S_FW_STOP]      = {"Остановить загрузку", "Stop download"},
+[S_FW_DLG_TITLE] = {"Поиск прошивки", "Search firmware"},
+[S_FW_DLG_LABEL] = {"Модель, кодовое имя или версия (пусто = подключённый телефон):",
+                    "Model, codename or version (empty = connected phone):"},
+[S_FW_RESULTS_TITLE] = {"Выбор прошивки", "Choose firmware"},
+[S_FW_CHOOSE]    = {"Выберите версию для загрузки:", "Choose a version to download:"},
+[S_FW_SOURCE]    = {"Источник:", "Source:"},
+[S_FW_DL_BTN]    = {"Скачать", "Download"},
+[S_FW_CANCEL]    = {"Отмена", "Cancel"},
 [S_READY]        = {"Mi OTA Sideload готов.", "Mi OTA Sideload ready."},
 [S_NOFW]         = {"Прошивка: не выбрана", "Firmware: none"},
 [S_FW]           = {"Прошивка:", "Firmware:"},
@@ -1216,6 +1242,385 @@ static DWORD WINAPI server_check_thread(LPVOID p) {
     return 0;
 }
 
+/* ============================================================ firmware fetch */
+/* forward decls (defined later in the file) */
+static void update_footer(void);
+static void app_path(char *out, int n, const char *leaf);
+
+#define DL_IDLE  0
+#define DL_RUN   1
+#define DL_PAUSE 2
+#define DL_STOP  3
+static volatile LONG g_dl_state = DL_IDLE;
+static char g_dl_url[1024] = {0};
+
+#define MAXRES 40
+static char g_res_ver[MAXRES][64];
+static char g_res_url[MAXRES][512];
+static int  g_res_count = 0, g_res_current = -1, g_res_sel = 0, g_mirror_sel = 0;
+static char g_dev_curver[64] = {0};
+static const char *MIRRORS[] = {
+    "bigota.d.miui.com", "hugeota.d.miui.com", "cdnorg.d.miui.com",
+    "bn.d.miui.com", "airtel.bigota.d.miui.com"
+};
+
+typedef struct { WCHAR host[256]; WCHAR path[1200]; INTERNET_PORT port; int secure; } url_t;
+
+static int url_parse(const char *url, url_t *u) {
+    const char *p = url; int sec;
+    if (!_strnicmp(p, "https://", 8)) { sec = 1; p += 8; }
+    else if (!_strnicmp(p, "http://", 7)) { sec = 0; p += 7; }
+    else return -1;
+    char host[256]; int i = 0;
+    while (*p && *p != '/' && *p != ':' && i < 255) host[i++] = *p++;
+    host[i] = 0;
+    int port = sec ? 443 : 80;
+    if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
+    const char *path = (*p) ? p : "/";
+    MultiByteToWideChar(CP_UTF8, 0, host, -1, u->host, 256);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, u->path, 1200);
+    u->port = (INTERNET_PORT)port; u->secure = sec;
+    return 0;
+}
+
+/* GET a text page (HTML). Returns malloc'd body or NULL. */
+static char *fetch_url_text(const char *url) {
+    url_t u; if (url_parse(url, &u)) return NULL;
+    char *resp = NULL;
+    HINTERNET s = WinHttpOpen(L"Mozilla/5.0 MiSideload",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) return NULL;
+    HINTERNET c = WinHttpConnect(s, u.host, u.port, 0);
+    if (c) {
+        HINTERNET r = WinHttpOpenRequest(c, L"GET", u.path, NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, u.secure ? WINHTTP_FLAG_SECURE : 0);
+        if (r) {
+            if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) &&
+                WinHttpReceiveResponse(r, NULL)) {
+                DWORD cap = 1 << 16, len = 0; resp = (char *)malloc(cap);
+                for (;;) {
+                    DWORD avail = 0; if (!WinHttpQueryDataAvailable(r, &avail) || !avail) break;
+                    if (len + avail + 1 > cap) { cap = len + avail + 1; resp = (char *)realloc(resp, cap); }
+                    DWORD got = 0; if (!WinHttpReadData(r, resp + len, avail, &got) || !got) break;
+                    len += got;
+                }
+                resp[len] = 0;
+            }
+            WinHttpCloseHandle(r);
+        }
+        WinHttpCloseHandle(c);
+    }
+    WinHttpCloseHandle(s);
+    return resp;
+}
+
+/* version = first path segment after ".com/" */
+static void url_version(const char *url, char *out, int n) {
+    const char *p = strstr(url, ".com/");
+    if (!p) { out[0] = 0; return; }
+    p += 5;
+    const char *e = strchr(p, '/');
+    int L = e ? (int)(e - p) : (int)strlen(p);
+    if (L <= 0 || L >= n) L = n - 1;
+    memcpy(out, p, L); out[L] = 0;
+}
+static void url_basename(const char *url, char *out, int n) {
+    const char *s = strrchr(url, '/');
+    s = s ? s + 1 : url;
+    strncpy(out, s, n - 1); out[n - 1] = 0;
+}
+
+/* pull recovery zip URLs (bigota .../miui_*.zip) out of the HTML, newest first, deduped */
+static int extract_recovery_urls(const char *html, char urls[][512], int maxn) {
+    int n = 0;
+    const char *p = html;
+    while (n < maxn && (p = strstr(p, "https://bigota.d.miui.com/")) != NULL) {
+        const char *e = p;
+        while (*e && *e != '"' && *e != '\'' && *e != ' ' && *e != '<' && *e != ')') e++;
+        size_t L = (size_t)(e - p);
+        if (L > 20 && L < 500) {
+            char tmp[512]; memcpy(tmp, p, L); tmp[L] = 0;
+            if (strstr(tmp, "/miui_") && L >= 4 && !strcmp(tmp + L - 4, ".zip")) {
+                int dup = 0; for (int i = 0; i < n; i++) if (!strcmp(urls[i], tmp)) { dup = 1; break; }
+                if (!dup) { strncpy(urls[n], tmp, 511); urls[n][511] = 0; n++; }
+            }
+        }
+        p = e;
+    }
+    return n;
+}
+
+/* one download attempt with resume; returns 0 done, 1 neterr, 2 stopped, 3 http, 4 fatal */
+static int download_once(const char *url, const char *path, long long *existing) {
+    url_t u; if (url_parse(url, &u)) return 4;
+    HINTERNET s = WinHttpOpen(L"Mozilla/5.0 MiSideload",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) return 1;
+    HINTERNET c = WinHttpConnect(s, u.host, u.port, 0);
+    if (!c) { WinHttpCloseHandle(s); return 1; }
+    HINTERNET r = WinHttpOpenRequest(c, L"GET", u.path, NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, u.secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!r) { WinHttpCloseHandle(c); WinHttpCloseHandle(s); return 1; }
+    if (*existing > 0) {
+        WCHAR rng[64]; wsprintfW(rng, L"Range: bytes=%I64d-", *existing);
+        WinHttpAddRequestHeaders(r, rng, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    }
+    int res = 1;
+    if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) &&
+        WinHttpReceiveResponse(r, NULL)) {
+        DWORD status = 0, sl = sizeof(status);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            NULL, &status, &sl, NULL);
+        int append = (status == 206);
+        if (*existing > 0 && status == 200) { *existing = 0; append = 0; }
+        if (status != 200 && status != 206) {
+            ui_log("HTTP %lu", status);
+            res = 3;
+        } else {
+            long long clen = 0;
+            { WCHAR cl[32]; DWORD cll = sizeof(cl);
+              if (WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH, NULL, cl, &cll, NULL))
+                  clen = _wtoi64(cl); }
+            long long total = *existing + clen;
+            FILE *fp = fopen(path, append ? "ab" : "wb");
+            if (!fp) { res = 4; }
+            else {
+                char *buf = (char *)malloc(1 << 16);
+                long long got = *existing; int last_pct = -1, last_dec = -1;
+                res = 0;
+                for (;;) {
+                    if (g_dl_state == DL_STOP) { res = 2; break; }
+                    while (g_dl_state == DL_PAUSE) {
+                        ui_status(g_lang ? "Download paused" : "Загрузка на паузе");
+                        Sleep(200);
+                    }
+                    if (g_dl_state == DL_STOP) { res = 2; break; }
+                    DWORD avail = 0;
+                    if (!WinHttpQueryDataAvailable(r, &avail)) { res = 1; break; }
+                    if (!avail) break;          /* done */
+                    if (avail > (1 << 16)) avail = 1 << 16;
+                    DWORD rd = 0;
+                    if (!WinHttpReadData(r, buf, avail, &rd) || !rd) { res = 1; break; }
+                    fwrite(buf, 1, rd, fp); got += rd; *existing = got;
+                    if (total > 0) {
+                        int pct = (int)(got * 100 / total);
+                        if (pct != last_pct) { ui_progress(pct); last_pct = pct; }
+                        if (pct / 10 != last_dec) {
+                            last_dec = pct / 10;
+                            ui_log(g_lang ? "Download: %d%%  (%lld / %lld MiB)"
+                                          : "Загрузка: %d%%  (%lld / %lld МиБ)",
+                                   pct, got / (1024 * 1024), total / (1024 * 1024));
+                            ui_status(g_lang ? "Downloading…" : "Загрузка…");
+                        }
+                    }
+                }
+                free(buf); fclose(fp);
+            }
+        }
+    }
+    WinHttpCloseHandle(r); WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+    return res;
+}
+
+/* full download with resume + network retry; runs in a worker thread */
+static void do_download(const char *url) {
+    char base[260]; url_basename(url, base, sizeof(base));
+    char path[MAX_PATH]; app_path(path, sizeof(path), base);
+    long long existing = 0;
+    { HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+      if (h != INVALID_HANDLE_VALUE) { LARGE_INTEGER sz; if (GetFileSizeEx(h, &sz)) existing = sz.QuadPart; CloseHandle(h); } }
+
+    ui_log(g_lang ? "Download: %s" : "Загрузка: %s", base);
+    if (existing > 0) ui_log(g_lang ? "  resuming from %lld MiB" : "  докачка с %lld МиБ",
+                             existing / (1024 * 1024));
+    ui_status(g_lang ? "Downloading…" : "Загрузка…");
+    g_dl_state = DL_RUN;
+
+    int retries = 0;
+    for (;;) {
+        int res = download_once(url, path, &existing);
+        if (res == 0) {
+            ui_log(g_lang ? "Download complete: %s" : "Загрузка завершена: %s", path);
+            ui_status(g_lang ? "Download complete" : "Загрузка завершена");
+            strncpy(g_firmware, path, sizeof(g_firmware) - 1); g_firmware[sizeof(g_firmware) - 1] = 0;
+            update_footer();
+            ui_log("%s", g_lang ? "Set as firmware. Menu > Start flashing."
+                                : "Выбрано как прошивка. Меню > Запустить прошивку.");
+            break;
+        }
+        if (res == 2) { ui_log("%s", g_lang ? "Download stopped (partial kept for resume)."
+                                            : "Загрузка остановлена (частично сохранено для докачки).");
+                        ui_status(g_lang ? "Stopped" : "Остановлено"); break; }
+        if (res == 3 || res == 4) { ui_log("%s", g_lang ? "Download failed." : "Загрузка не удалась."); break; }
+        if (g_dl_state == DL_STOP) { ui_log("%s", g_lang ? "Download stopped." : "Загрузка остановлена."); break; }
+        if (++retries > 15) { ui_log("%s", g_lang ? "Network error — paused. Search again to resume."
+                                                  : "Ошибка сети — пауза. Повторите поиск для докачки."); break; }
+        ui_log(g_lang ? "Network error — retry %d…" : "Ошибка сети — повтор %d…", retries);
+        Sleep(3000);
+    }
+    g_dl_state = DL_IDLE;
+}
+
+/* small model -> codename map (best-effort; codename input is always reliable) */
+static const char *model_to_codename(const char *lo) {
+    static const char *map[][2] = {
+        {"xiaomi 11t", "agate"}, {"11t", "agate"},
+        {"xiaomi 11t pro", "vili"}, {"11t pro", "vili"},
+        {"xiaomi 12", "cupid"}, {"xiaomi 12 pro", "zeus"},
+        {"xiaomi 13", "fuxi"}, {"xiaomi 13 pro", "nuwa"},
+        {"redmi note 7", "lavender"}, {"redmi note 8", "ginkgo"},
+        {"redmi note 8 pro", "begonia"}, {"redmi note 9", "merlin"},
+        {"redmi note 9 pro", "joyeuse"}, {"redmi note 10 pro", "sweet"},
+        {"redmi note 11 pro", "pissarro"}, {"redmi note 12 pro", "ruby"},
+        {"redmi 9t", "lime"}, {"redmi 9", "lancelot"},
+        {"poco f3", "alioth"}, {"poco x3 pro", "vayu"}, {"poco f4", "munch"},
+        {"redmi note 10", "mojito"}, {"redmi note 12", "tapas"},
+    };
+    for (int i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++)
+        if (strstr(lo, map[i][0])) return map[i][1];
+    return NULL;
+}
+
+/* firmware search thread: resolve codename/region, list ezbox recovery ROMs, download pick */
+/* build a URL on the chosen mirror host (stored URLs are bigota.d.miui.com/...) */
+static void build_mirror_url(const char *url, int mi, char *out, int n) {
+    strncpy(out, url, n - 1); out[n - 1] = 0;
+    if (mi <= 0 || mi >= (int)(sizeof(MIRRORS) / sizeof(MIRRORS[0]))) return;
+    char *h = strstr(out, "bigota.d.miui.com");
+    if (!h) return;
+    char *slash = strchr(h, '/');
+    char tail[512]; strncpy(tail, slash ? slash : "", sizeof(tail) - 1); tail[sizeof(tail) - 1] = 0;
+    int pre = (int)(h - out);
+    char head[32]; if (pre >= (int)sizeof(head)) pre = sizeof(head) - 1;
+    memcpy(head, out, pre); head[pre] = 0;
+    _snprintf(out, n, "%s%s%s", head, MIRRORS[mi], tail);
+}
+
+/* normalize a region token, or NULL */
+static const char *region_norm(const char *t) {
+    static const char *r[][2] = {
+        {"global","global"},{"eea","eea"},{"europe","eea"},{"ru","ru"},{"russia","ru"},
+        {"in","in"},{"india","in"},{"id","id"},{"indonesia","id"},{"tw","tw"},{"taiwan","tw"},
+        {"cn","cn"},{"china","cn"},{"jp","jp"},{"japan","jp"},{"kr","kr"},{"korea","kr"},
+    };
+    for (int i = 0; i < (int)(sizeof(r) / sizeof(r[0])); i++)
+        if (!strcmp(t, r[i][0])) return r[i][1];
+    return NULL;
+}
+
+/* download worker: pulls URL from g_dl_url */
+static DWORD WINAPI dl_thread(LPVOID p) {
+    (void)p;
+    do_download(g_dl_url);
+    PostMessage(g_main, WM_APP_DONE, 0, 0);
+    return 0;
+}
+
+/* firmware search: resolve codename/region, list ezbox recovery ROMs into the
+ * results table, then hand off to the UI to let the user choose. */
+static DWORD WINAPI fw_search_thread(LPVOID param) {
+    char q[160] = {0};
+    if (param) { strncpy(q, (char *)param, 159); free(param); }
+
+    char codename[64] = {0}, region[16] = {0}, target_ver[64] = {0}; int want_exact = 0;
+    g_dev_curver[0] = 0;
+
+    /* device gives codename + region + current version */
+    { adb_dev d; char err[128], ban[512];
+      if (dev_open(&d, err, sizeof(err)) == 0 && adb_connect(&d, ban, sizeof(ban)) == 0) {
+          char dev[64] = {0}; adb_service(&d, "getdevice:", dev, sizeof(dev));
+          adb_service(&d, "getversion:", g_dev_curver, sizeof(g_dev_curver));
+          dev_close(&d);
+          int i = 0; for (; dev[i] && dev[i] != '_' && i < 63; i++) codename[i] = dev[i]; codename[i] = 0;
+          char lo[64]; strncpy(lo, dev, 63); lo[63] = 0;
+          for (char *p = lo; *p; p++) *p = (char)tolower((unsigned char)*p);
+          if (strstr(lo, "eea")) strcpy(region, "eea");
+          else if (strstr(lo, "russia") || strstr(lo, "_ru")) strcpy(region, "ru");
+          else if (strstr(lo, "india")  || strstr(lo, "_in")) strcpy(region, "in");
+          else if (strstr(lo, "taiwan") || strstr(lo, "_tw")) strcpy(region, "tw");
+          else if (strstr(lo, "global")) strcpy(region, "global");
+      }
+    }
+
+    /* query can override codename / region / exact version */
+    if (q[0]) {
+        char lo[160]; strncpy(lo, q, 159); lo[159] = 0;
+        for (char *p = lo; *p; p++) *p = (char)tolower((unsigned char)*p);
+        const char *mc = model_to_codename(lo);
+        if (mc) { strncpy(codename, mc, 63); codename[63] = 0; }
+        char tmp[160]; strncpy(tmp, lo, 159); tmp[159] = 0;
+        char cand[64] = "";
+        for (char *tok = strtok(tmp, " "); tok; tok = strtok(NULL, " ")) {
+            const char *rg = region_norm(tok);
+            int isver = ((tok[0] == 'v' || !_strnicmp(tok, "os", 2)) && strchr(tok, '.'));
+            if (rg) { strncpy(region, rg, 15); region[15] = 0; }
+            else if (isver) { strncpy(target_ver, tok, 63); target_ver[63] = 0; want_exact = 1;
+                              for (char *p = target_ver; *p; p++) *p = (char)toupper((unsigned char)*p); }
+            else if (!cand[0]) { strncpy(cand, tok, 63); cand[63] = 0; }
+        }
+        if (!mc && cand[0]) { strncpy(codename, cand, 63); codename[63] = 0; }
+    }
+    if (!region[0]) strcpy(region, "global");
+    if (!codename[0]) {
+        ui_log("%s", g_lang ? "No device/codename. Connect the phone or type a codename (e.g. agate)."
+                            : "Нет устройства/кодового имени. Подключите телефон или введите кодовое имя (напр. agate).");
+        g_res_count = 0; goto post;
+    }
+
+    ui_log(g_lang ? "Searching firmware: codename=%s, region=%s"
+                  : "Поиск прошивки: кодовое имя=%s, регион=%s", codename, region);
+
+    const char *regions[6]; int nr = 0; regions[nr++] = region;
+    const char *fb[] = { "global", "eea", "ru", "in", "tw" };
+    for (int i = 0; i < 5; i++) { int dup = 0;
+        for (int j = 0; j < nr; j++) if (!strcmp(regions[j], fb[i])) dup = 1;
+        if (!dup && nr < 6) regions[nr++] = fb[i]; }
+
+    g_res_count = 0; g_res_current = -1; g_res_sel = 0;
+    for (int ri = 0; ri < nr && g_res_count == 0; ri++) {
+        char url[256];
+        _snprintf(url, sizeof(url), "https://mirom.ezbox.idv.tw/en/phone/%s/roms-%s-stable/",
+                  codename, regions[ri]);
+        char *html = fetch_url_text(url);
+        if (!html) continue;
+        static char urls[40][512];
+        int n = extract_recovery_urls(html, urls, 40);
+        free(html);
+        if (n <= 0) continue;
+        for (int i = 0; i < n && g_res_count < MAXRES; i++) {
+            url_version(urls[i], g_res_ver[g_res_count], 64);
+            strncpy(g_res_url[g_res_count], urls[i], 511); g_res_url[g_res_count][511] = 0;
+            g_res_count++;
+        }
+        ui_log(g_lang ? "[%s] %d recovery ROMs (newest first):" : "[%s] %d recovery-прошивок (сначала новые):",
+               regions[ri], g_res_count);
+        for (int i = 0; i < g_res_count && i < 12; i++)
+            ui_log("  %s%s", g_res_ver[i], i == 0 ? (g_lang ? "  (latest)" : "  (последняя)") : "");
+    }
+
+    if (g_res_count == 0) {
+        ui_log("%s", g_lang ? "Nothing found. Check the codename (e.g. agate) or open the site."
+                            : "Ничего не найдено. Проверьте кодовое имя (напр. agate) или откройте сайт.");
+        goto post;
+    }
+    for (int i = 0; i < g_res_count; i++)
+        if (g_dev_curver[0] && !_stricmp(g_res_ver[i], g_dev_curver)) { g_res_current = i; break; }
+    if (want_exact)
+        for (int i = 0; i < g_res_count; i++)
+            if (!_stricmp(g_res_ver[i], target_ver)) { g_res_current = i; break; }
+    g_res_sel = (g_res_current >= 0) ? g_res_current : 0;
+    if (g_res_current >= 0)
+        ui_log(g_lang ? "Match in list: %s (preselected)" : "Совпадение в списке: %s (выбрано по умолчанию)",
+               g_res_ver[g_res_current]);
+    else if (g_dev_curver[0])
+        ui_log(g_lang ? "Current build %s not in this region list — latest preselected."
+                      : "Текущей сборки %s нет в списке региона — выбрана последняя.", g_dev_curver);
+
+post:
+    PostMessage(g_main, WM_APP_RESULTS, 0, 0);
+    return 0;
+}
+
 /* ============================================================ worker threads */
 #define FLASH_MAX_TRIES 3
 
@@ -1398,7 +1803,6 @@ static void build_menu(void) {
     Lw(S_OPEN, w, 160);      AppendMenuW(m1, MF_STRING, IDM_OPEN, w);
     Lw(S_INFO, w, 160);      AppendMenuW(m1, MF_STRING, IDM_INFO, w);
     Lw(S_SERVER, w, 160);    AppendMenuW(m1, MF_STRING, IDM_SERVER, w);
-    Lw(S_DOWNLOADS, w, 160); AppendMenuW(m1, MF_STRING, IDM_DOWNLOADS, w);
     Lw(S_START, w, 160);     AppendMenuW(m1, MF_STRING, IDM_START, w);
     AppendMenuW(m1, MF_SEPARATOR, 0, NULL);
     Lw(S_ABOUT, w, 160);     AppendMenuW(m1, MF_STRING, IDM_ABOUT, w);
@@ -1427,6 +1831,14 @@ static void build_menu(void) {
 
     Lw(S_MENU, w, 160);      AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)m1, w);
     Lw(S_ADB, w, 160);       AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)m2, w);
+    HMENU mfw = CreatePopupMenu();
+    Lw(S_FW_MIUIER, w, 160); AppendMenuW(mfw, MF_STRING, IDM_FW_MIUIER, w);
+    Lw(S_FW_EZBOX, w, 160);  AppendMenuW(mfw, MF_STRING, IDM_FW_EZBOX, w);
+    Lw(S_FW_SEARCH, w, 160); AppendMenuW(mfw, MF_STRING, IDM_FW_SEARCH, w);
+    AppendMenuW(mfw, MF_SEPARATOR, 0, NULL);
+    Lw(S_FW_PAUSE, w, 160);  AppendMenuW(mfw, MF_STRING, IDM_FW_PAUSE, w);
+    Lw(S_FW_STOP, w, 160);   AppendMenuW(mfw, MF_STRING, IDM_FW_STOP, w);
+    Lw(S_FW_MENU, w, 160);   AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)mfw, w);
     Lw(S_SETTINGS, w, 160);  AppendMenuW(g_menu, MF_POPUP, (UINT_PTR)m3, w);
 
     SetMenu(g_main, g_menu);
@@ -1551,6 +1963,60 @@ static void start_thread(LPTHREAD_START_ROUTINE fn) {
 }
 
 /* ============================================================ window proc */
+static INT_PTR CALLBACK ResultsDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    (void)l;
+    switch (m) {
+    case WM_INITDIALOG: {
+        WCHAR t[192];
+        Lw(S_FW_RESULTS_TITLE, t, 192); SetWindowTextW(h, t);
+        Lw(S_FW_CHOOSE, t, 192); SetDlgItemTextW(h, 203, t);
+        Lw(S_FW_SOURCE, t, 192); SetDlgItemTextW(h, 204, t);
+        Lw(S_FW_DL_BTN, t, 192); SetDlgItemTextW(h, IDOK, t);
+        Lw(S_FW_CANCEL, t, 192); SetDlgItemTextW(h, IDCANCEL, t);
+        for (int i = 0; i < g_res_count; i++) {
+            const char *tag = "";
+            if (i == g_res_current && i == 0) tag = g_lang ? "  (current, latest)" : "  (текущая, последняя)";
+            else if (i == g_res_current)      tag = g_lang ? "  (current)" : "  (текущая)";
+            else if (i == 0)                  tag = g_lang ? "  (latest)"  : "  (последняя)";
+            char line[128]; _snprintf(line, sizeof(line), "%s%s", g_res_ver[i], tag);
+            WCHAR *wl = u8towide(line); SendDlgItemMessageW(h, 201, LB_ADDSTRING, 0, (LPARAM)wl); free(wl);
+        }
+        SendDlgItemMessageW(h, 201, LB_SETCURSEL, (WPARAM)(g_res_sel < 0 ? 0 : g_res_sel), 0);
+        for (int i = 0; i < (int)(sizeof(MIRRORS) / sizeof(MIRRORS[0])); i++) {
+            WCHAR *wm = u8towide(MIRRORS[i]); SendDlgItemMessageW(h, 202, CB_ADDSTRING, 0, (LPARAM)wm); free(wm);
+        }
+        SendDlgItemMessageW(h, 202, CB_SETCURSEL, 0, 0);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) {
+            int se = (int)SendDlgItemMessageW(h, 201, LB_GETCURSEL, 0, 0); if (se < 0) se = 0; g_res_sel = se;
+            int mm = (int)SendDlgItemMessageW(h, 202, CB_GETCURSEL, 0, 0); if (mm < 0) mm = 0; g_mirror_sel = mm;
+            EndDialog(h, 1); return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL) { EndDialog(h, 0); return TRUE; }
+        break;
+    }
+    return FALSE;
+}
+
+static char g_search_out[128];
+static INT_PTR CALLBACK SearchDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    (void)l;
+    switch (m) {
+    case WM_INITDIALOG: {
+        WCHAR t[192]; Lw(S_FW_DLG_TITLE, t, 192); SetWindowTextW(h, t);
+        Lw(S_FW_DLG_LABEL, t, 192); SetDlgItemTextW(h, 102, t);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) { GetDlgItemTextA(h, IDC_SEARCH_EDIT, g_search_out, sizeof(g_search_out)); EndDialog(h, 1); return TRUE; }
+        if (LOWORD(w) == IDCANCEL) { EndDialog(h, 0); return TRUE; }
+        break;
+    }
+    return FALSE;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -1592,9 +2058,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_busy) { ui_log("%s", g_lang ? "Checking server..." : "Проверка сервера…");
                            start_thread(server_check_thread); }
             return 0;
-        case IDM_DOWNLOADS:
-            ShellExecuteW(g_main, L"open",
-                          L"https://xiaomifirmwareupdater.com/", NULL, NULL, SW_SHOWNORMAL);
+        case IDM_FW_MIUIER:
+            ShellExecuteW(hwnd, L"open", L"https://roms.miuier.com/en-us/", NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        case IDM_FW_EZBOX:
+            ShellExecuteW(hwnd, L"open", L"https://mirom.ezbox.idv.tw/en/phone/", NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        case IDM_FW_SEARCH:
+            if (g_busy) return 0;
+            if (DialogBoxParamW(GetModuleHandle(NULL), MAKEINTRESOURCEW(IDD_SEARCH), hwnd, SearchDlgProc, 0) == 1) {
+                set_busy(1);
+                CloseHandle(CreateThread(NULL, 0, fw_search_thread, _strdup(g_search_out), 0, NULL));
+            }
+            return 0;
+        case IDM_FW_PAUSE:
+            if (g_dl_state == DL_RUN) g_dl_state = DL_PAUSE;
+            else if (g_dl_state == DL_PAUSE) g_dl_state = DL_RUN;
+            return 0;
+        case IDM_FW_STOP:
+            if (g_dl_state == DL_RUN || g_dl_state == DL_PAUSE) g_dl_state = DL_STOP;
             return 0;
         case IDM_START:  start_flash(); return 0;
         case IDM_ABOUT:
@@ -1671,6 +2153,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_PROG:
         SendMessage(g_prog, PBM_SETPOS, (WPARAM)(int)wp, 0); return 0;
+    case WM_APP_RESULTS:
+        set_busy(0);
+        if (g_res_count > 0 &&
+            DialogBoxParamW(GetModuleHandle(NULL), MAKEINTRESOURCEW(IDD_RESULTS), hwnd, ResultsDlgProc, 0) == 1) {
+            char url[600]; build_mirror_url(g_res_url[g_res_sel], g_mirror_sel, url, sizeof(url));
+            strncpy(g_dl_url, url, sizeof(g_dl_url) - 1); g_dl_url[sizeof(g_dl_url) - 1] = 0;
+            ui_log(g_lang ? "Selected %s via %s" : "Выбрано %s через %s",
+                   g_res_ver[g_res_sel], MIRRORS[g_mirror_sel]);
+            set_busy(1);
+            CloseHandle(CreateThread(NULL, 0, dl_thread, NULL, 0, NULL));
+        }
+        return 0;
     case WM_APP_DONE:
         set_busy(0); return 0;
 

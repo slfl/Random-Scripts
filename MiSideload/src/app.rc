@@ -5,3 +5,29 @@
 
 /* application icon (lowest ID -> used by Explorer for the .exe) */
 1 ICON "app.ico"
+
+/* firmware search input dialog */
+100 DIALOGEX 0, 0, 272, 76
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Search firmware"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Model, codename or version:", 102, 8, 8, 256, 18
+    EDITTEXT        101, 8, 28, 256, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 160, 52, 50, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 214, 52, 50, 16
+END
+
+/* firmware results / choose dialog */
+110 DIALOGEX 0, 0, 330, 226
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Choose firmware"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT       "Choose a version:", 203, 8, 6, 314, 10
+    LISTBOX     201, 8, 18, 314, 156, LBS_NOTIFY | WS_VSCROLL | WS_BORDER
+    LTEXT       "Source:", 204, 8, 180, 44, 10
+    COMBOBOX    202, 54, 178, 150, 100, CBS_DROPDOWNLIST | WS_VSCROLL
+    DEFPUSHBUTTON "Download", IDOK, 214, 202, 54, 16
+    PUSHBUTTON    "Cancel", IDCANCEL, 272, 202, 50, 16
+END
