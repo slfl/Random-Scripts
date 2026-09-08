@@ -301,22 +301,22 @@ static int finish_open(const char *path, adb_dev *d, int *denied) {
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
         if (e == ERROR_ACCESS_DENIED) *denied = 1;
-        if (g_verbose) ui_log("    open fail (err %lu): %s", e, path);
+        if (g_verbose) ui_log(g_lang ? "    open failed (err %lu): %s" : "    не удалось открыть (код %lu): %s", e, path);
         return 0;
     }
     WINUSB_INTERFACE_HANDLE wu;
     if (!WinUsb_Initialize(h, &wu)) {
-        if (g_verbose) ui_log("    WinUsb_Initialize failed (err %lu)", GetLastError());
+        if (g_verbose) ui_log(g_lang ? "    WinUsb_Initialize failed (err %lu)" : "    WinUsb_Initialize не удался (код %lu)", GetLastError());
         CloseHandle(h); return 0;
     }
     USB_INTERFACE_DESCRIPTOR id;
     if (!WinUsb_QueryInterfaceSettings(wu, 0, &id)) {
-        if (g_verbose) ui_log("    QueryInterfaceSettings failed");
+        if (g_verbose) ui_log("%s", g_lang ? "    QueryInterfaceSettings failed" : "    QueryInterfaceSettings не удался");
         WinUsb_Free(wu); CloseHandle(h); return 0;
     }
     if (id.bInterfaceClass != 0xFF || id.bInterfaceSubClass != 0x42 ||
         id.bInterfaceProtocol != 0x01) {
-        if (g_verbose) ui_log("    not ADB iface (cls=%u/sub=%u/proto=%u)",
+        if (g_verbose) ui_log(g_lang ? "    not ADB iface (cls=%u/sub=%u/proto=%u)" : "    не ADB-интерфейс (cls=%u/sub=%u/proto=%u)",
                               id.bInterfaceClass, id.bInterfaceSubClass,
                               id.bInterfaceProtocol);
         WinUsb_Free(wu); CloseHandle(h); return 0;
@@ -337,7 +337,7 @@ static int finish_open(const char *path, adb_dev *d, int *denied) {
     WinUsb_SetPipePolicy(wu, in,  AUTO_CLEAR_STALL,    sizeof(yes), &yes);
     WinUsb_SetPipePolicy(wu, out, AUTO_CLEAR_STALL,    sizeof(yes), &yes);
     d->file = h; d->winusb = wu; d->ep_in = in; d->ep_out = out; d->local_id = 1;
-    if (g_verbose) ui_log("    OK: ADB interface opened (ep_in=0x%02x ep_out=0x%02x)", in, out);
+    if (g_verbose) ui_log(g_lang ? "    OK: ADB interface opened (ep_in=0x%02x ep_out=0x%02x)" : "    OK: ADB-интерфейс открыт (ep_in=0x%02x ep_out=0x%02x)", in, out);
     return 1;
 }
 
@@ -360,12 +360,12 @@ static int open_for_devnode(HDEVINFO info, SP_DEVINFO_DATA *dd,
                               (LPBYTE)guids, &len);
     }
     RegCloseKey(k);
-    if (rr != ERROR_SUCCESS) { if (g_verbose) ui_log("    no DeviceInterfaceGUIDs value"); return 0; }
+    if (rr != ERROR_SUCCESS) { if (g_verbose) ui_log("%s", g_lang ? "    no DeviceInterfaceGUIDs value" : "    нет DeviceInterfaceGUIDs"); return 0; }
 
     for (char *gp = guids; *gp; gp += strlen(gp) + 1) {
         GUID g;
         if (!parse_guid(gp, &g)) continue;
-        if (g_verbose) ui_log("    trying registered GUID %s", gp);
+        if (g_verbose) ui_log(g_lang ? "    trying registered GUID %s" : "    пробую зарегистрированный GUID %s", gp);
         HDEVINFO i2 = SetupDiGetClassDevs(&g, NULL, NULL,
                                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
         if (i2 == INVALID_HANDLE_VALUE) continue;
@@ -420,16 +420,36 @@ static void diagnose_usb(void) {
         for (char *p = lo; *p; p++) *p = (char)tolower((unsigned char)*p);
         if (strstr(lo, "vid_18d1") || strstr(lo, "vid_2717") ||
             strstr(lo, "vid_05c6") /* Qualcomm/EDL */) {
-            ui_log("  USB %s  driver=%s", hw, svc[0] ? svc : "(none)");
+            ui_log(g_lang ? "  USB %s  driver=%s" : "  USB %s  драйвер=%s", hw, svc[0] ? svc : "(none)");
             any = 1;
         }
     }
     SetupDiDestroyDeviceInfoList(info);
     if (!any)
-        ui_log("  No Xiaomi/Google USB device visible. Check cable / MiAssistant mode / driver.");
+        ui_log("%s", g_lang ? "  No Xiaomi/Google USB device visible. Check cable / MiAssistant mode / driver."
+                            : "  USB-устройств Xiaomi/Google не видно. Проверьте кабель / режим MiAssistant / драйвер.");
 }
 
 /* returns 0 ok; 1 not found; 2 found but access denied (adb server?) */
+/* localized guidance when the phone can't be opened */
+static void log_conn_help(void) {
+    if (g_lang) {
+        ui_log("%s", "Hint:");
+        ui_log("%s", "  1) On the phone enter Recovery and choose \"Connect with MiAssistant\".");
+        ui_log("%s", "  2) Plug the phone into the PC (rear USB 2.0 port, no hub).");
+        ui_log("%s", "  3) Press ADB > Kill server.");
+        ui_log("%s", "  4) Menu > Phone info.");
+        ui_log("%s", "  Driver/busy issues: close adb.exe and Mi tools; if driver != WinUSB, install WinUSB with Zadig on the VID 18D1/2717 interface.");
+    } else {
+        ui_log("%s", "Подсказка:");
+        ui_log("%s", "  1) На телефоне войдите в Recovery и выберите «Connect with MiAssistant» (连接小米助手).");
+        ui_log("%s", "  2) Подключите телефон к ПК кабелем (лучше задний порт USB 2.0, без хаба).");
+        ui_log("%s", "  3) Нажмите ADB → Kill server.");
+        ui_log("%s", "  4) Меню → Информация о телефоне.");
+        ui_log("%s", "  Если про драйвер/занятость: закройте adb.exe и Mi-утилиты; если драйвер ≠ WinUSB — поставьте WinUSB через Zadig на интерфейс с VID 18D1/2717.");
+    }
+}
+
 /* Enumerate all present USB devices; for each WinUSB-backed one, resolve and
  * open its ADB interface. This mirrors how libusb finds the phone. */
 static int dev_open(adb_dev *d, char *errbuf, int errlen) {
@@ -459,7 +479,7 @@ static int dev_open(adb_dev *d, char *errbuf, int errlen) {
             saw_winusb = 1;
             if (g_verbose) {
                 char hw[256]; devprop_sz(info, &dd, SPDRP_HARDWAREID, hw, sizeof(hw));
-                ui_log("  WinUSB device: %s", hw);
+                ui_log(g_lang ? "  WinUSB device: %s" : "  WinUSB-устройство: %s", hw);
             }
             int got = open_for_devnode(info, &dd, det->DevicePath, d, &denied);
             free(det);
@@ -469,20 +489,23 @@ static int dev_open(adb_dev *d, char *errbuf, int errlen) {
     }
 
     if (denied) {
-        _snprintf(errbuf, errlen,
-            "ADB interface is present but busy (access denied). Press \"Kill ADB "
-            "server\", close Mi PC Suite / MiFlash / Android Studio / python.exe, "
-            "replug, and retry.");
+        _snprintf(errbuf, errlen, "%s", g_lang
+            ? "ADB interface is present but busy (access denied). Press \"Kill ADB "
+              "server\", close Mi PC Suite / MiFlash / Android Studio / python.exe, replug, and retry."
+            : "ADB-интерфейс найден, но занят (доступ запрещён). Нажмите \"Kill ADB server\", "
+              "закройте Mi PC Suite / MiFlash / Android Studio / python.exe, переподключите кабель и повторите.");
         return 2;
     }
     if (saw_winusb)
-        _snprintf(errbuf, errlen,
-            "A WinUSB device is present but its ADB interface could not be opened. "
-            "Enable \"Check device\" logging shows why (see lines above).");
+        _snprintf(errbuf, errlen, "%s", g_lang
+            ? "A WinUSB device is present but its ADB interface could not be opened (see lines above)."
+            : "WinUSB-устройство есть, но открыть его ADB-интерфейс не удалось (см. строки выше).");
     else
-        _snprintf(errbuf, errlen,
-            "No WinUSB ADB interface found. Phone must be in MiAssistant mode with a "
-            "WinUSB driver on its ADB interface (see the device list below).");
+        _snprintf(errbuf, errlen, "%s", g_lang
+            ? "No WinUSB ADB interface found. Phone must be in MiAssistant mode with a WinUSB driver "
+              "on its ADB interface (see the device list below)."
+            : "ADB-интерфейс WinUSB не найден. Телефон должен быть в режиме MiAssistant, а на его "
+              "ADB-интерфейсе — драйвер WinUSB (см. список устройств ниже).");
     return 1;
 }
 
@@ -1748,7 +1771,7 @@ static DWORD WINAPI flash_thread(LPVOID param) {
         ui_status(L(S_ST_CONNECTING));
         int r = dev_open(&d, err, sizeof(err));
         if (r) { ui_log("ERROR: %s", err);
-                 if (attempt == 1) { ui_log("Devices seen:"); diagnose_usb(); }
+                 if (attempt == 1) { ui_log("%s", g_lang ? "Devices seen:" : "Найденные устройства:"); diagnose_usb(); log_conn_help(); }
                  ui_status(L(S_ST_NOTCONN)); Sleep(3000); continue; }
 
         r = adb_connect(&d, banner, sizeof(banner));
@@ -1816,7 +1839,7 @@ static DWORD WINAPI check_thread(LPVOID param) {
     g_verbose = 1;
     int r = dev_open(&d, err, sizeof(err));
     g_verbose = 0;
-    if (r) { ui_log("%s", err); ui_log("Devices seen:"); diagnose_usb();
+    if (r) { ui_log("%s", err); ui_log("%s", g_lang ? "Devices seen:" : "Найденные устройства:"); diagnose_usb(); log_conn_help();
              ui_status(r == 2 ? L(S_ST_BUSY) : L(S_ST_NODEV)); goto done; }
     r = adb_connect(&d, banner, sizeof(banner));
     if (r) { ui_log("%s", g_lang ? "Device found but not in sideload mode."
