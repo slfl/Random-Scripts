@@ -1,9 +1,6 @@
 #include <windows.h>
 
-/* CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24) */
 1 24 "app.manifest"
-
-/* application icon (lowest ID -> used by Explorer for the .exe) */
 1 ICON "app.ico"
 
 /* firmware search input dialog */
@@ -19,15 +16,17 @@ BEGIN
 END
 
 /* firmware results / choose dialog */
-110 DIALOGEX 0, 0, 330, 226
+110 DIALOGEX 0, 0, 336, 226
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Choose firmware"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT       "Choose a version:", 203, 8, 6, 314, 10
-    LISTBOX     201, 8, 18, 314, 156, LBS_NOTIFY | WS_VSCROLL | WS_BORDER
-    LTEXT       "Source:", 204, 8, 180, 44, 10
-    COMBOBOX    202, 54, 178, 150, 100, CBS_DROPDOWNLIST | WS_VSCROLL
-    DEFPUSHBUTTON "Download", IDOK, 214, 202, 54, 16
-    PUSHBUTTON    "Cancel", IDCANCEL, 272, 202, 50, 16
+    LTEXT       "Choose a version:", 203, 8, 6, 320, 10
+    LISTBOX     201, 8, 18, 320, 152, LBS_NOTIFY | WS_VSCROLL | WS_BORDER
+    LTEXT       "Region:", 206, 8, 178, 40, 10
+    COMBOBOX    205, 46, 176, 84, 200, CBS_DROPDOWNLIST | WS_VSCROLL
+    LTEXT       "Source:", 204, 140, 178, 40, 10
+    COMBOBOX    202, 178, 176, 150, 200, CBS_DROPDOWNLIST | WS_VSCROLL
+    DEFPUSHBUTTON "Download", IDOK, 220, 202, 54, 16
+    PUSHBUTTON    "Cancel", IDCANCEL, 278, 202, 50, 16
 END

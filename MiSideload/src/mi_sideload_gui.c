@@ -150,7 +150,7 @@ enum {
     S_SET_WIPE, S_SET_LOGS, S_SET_GENTLE, S_LANG, S_LANG_RU, S_LANG_EN,
     S_FW_MENU, S_FW_MIUIER, S_FW_EZBOX, S_FW_SEARCH, S_FW_PAUSE, S_FW_STOP,
     S_FW_DLG_TITLE, S_FW_DLG_LABEL,
-    S_FW_RESULTS_TITLE, S_FW_CHOOSE, S_FW_SOURCE, S_FW_DL_BTN, S_FW_CANCEL,
+    S_FW_RESULTS_TITLE, S_FW_CHOOSE, S_FW_SOURCE, S_FW_REGION, S_FW_DL_BTN, S_FW_CANCEL,
     S_READY, S_NOFW, S_FW, S_ADBPATH_DEFAULT,
     S_ST_READY, S_ST_CONNECTING, S_ST_INFO, S_ST_TOKEN, S_ST_WIPE,
     S_ST_FLASHING, S_ST_DONE, S_ST_NOTCONN, S_ST_BUSY, S_ST_NODEV, S_ST_DEVREADY,
@@ -193,6 +193,7 @@ static const char *STR[S_COUNT][2] = {
 [S_FW_RESULTS_TITLE] = {"Выбор прошивки", "Choose firmware"},
 [S_FW_CHOOSE]    = {"Выберите версию для загрузки:", "Choose a version to download:"},
 [S_FW_SOURCE]    = {"Источник:", "Source:"},
+[S_FW_REGION]    = {"Регион:", "Region:"},
 [S_FW_DL_BTN]    = {"Скачать", "Download"},
 [S_FW_CANCEL]    = {"Отмена", "Cancel"},
 [S_READY]        = {"Mi OTA Sideload готов.", "Mi OTA Sideload ready."},
@@ -1259,6 +1260,9 @@ static char g_res_ver[MAXRES][64];
 static char g_res_url[MAXRES][512];
 static int  g_res_count = 0, g_res_current = -1, g_res_sel = 0, g_mirror_sel = 0;
 static char g_dev_curver[64] = {0};
+static char g_res_codename[64] = {0};
+static char g_res_region[16] = {0};
+static const char *REGIONS[] = { "global","eea","ru","in","id","tw","cn","jp","kr" };
 static const char *MIRRORS[] = {
     "bigota.d.miui.com", "hugeota.d.miui.com", "cdnorg.d.miui.com",
     "bn.d.miui.com", "airtel.bigota.d.miui.com"
@@ -1387,6 +1391,8 @@ static int download_once(const char *url, const char *path, long long *existing)
             else {
                 char *buf = (char *)malloc(1 << 16);
                 long long got = *existing; int last_pct = -1, last_dec = -1;
+                ULONGLONG sp_last = GetTickCount64(); long long sp_bytes = got;
+                char spbuf[32] = "";
                 res = 0;
                 for (;;) {
                     if (g_dl_state == DL_STOP) { res = 2; break; }
@@ -1402,16 +1408,38 @@ static int download_once(const char *url, const char *path, long long *existing)
                     DWORD rd = 0;
                     if (!WinHttpReadData(r, buf, avail, &rd) || !rd) { res = 1; break; }
                     fwrite(buf, 1, rd, fp); got += rd; *existing = got;
+                    ULONGLONG now = GetTickCount64(); int tick = 0;
+                    if (now - sp_last >= 700) {
+                        double dt = (now - sp_last) / 1000.0;
+                        double bps = dt > 0 ? (double)(got - sp_bytes) / dt : 0;
+                        sp_last = now; sp_bytes = got;
+                        if (bps >= 1048576.0) _snprintf(spbuf, sizeof(spbuf), "%.1f MB/s", bps / 1048576.0);
+                        else                  _snprintf(spbuf, sizeof(spbuf), "%.0f KB/s", bps / 1024.0);
+                        tick = 1;
+                    }
                     if (total > 0) {
                         int pct = (int)(got * 100 / total);
-                        if (pct != last_pct) { ui_progress(pct); last_pct = pct; }
-                        if (pct / 10 != last_dec) {
-                            last_dec = pct / 10;
-                            ui_log(g_lang ? "Download: %d%%  (%lld / %lld MiB)"
-                                          : "Загрузка: %d%%  (%lld / %lld МиБ)",
-                                   pct, got / (1024 * 1024), total / (1024 * 1024));
-                            ui_status(g_lang ? "Downloading…" : "Загрузка…");
+                        if (pct != last_pct) { ui_progress(pct); last_pct = pct; tick = 1; }
+                        if (tick) {
+                            char st[160];
+                            _snprintf(st, sizeof(st),
+                                g_lang ? "Downloading: %d%%  %s  (%lld / %lld MiB)"
+                                       : "Загрузка: %d%%  %s  (%lld / %lld МиБ)",
+                                pct, spbuf, got / (1024 * 1024), total / (1024 * 1024));
+                            ui_status(st);
                         }
+                        if (pct / 2 != last_dec) {
+                            last_dec = pct / 2;
+                            ui_log(g_lang ? "Download: %d%%  %s  (%lld / %lld MiB)"
+                                          : "Загрузка: %d%%  %s  (%lld / %lld МиБ)",
+                                   pct, spbuf, got / (1024 * 1024), total / (1024 * 1024));
+                        }
+                    } else if (tick) {
+                        char st[128];
+                        _snprintf(st, sizeof(st),
+                            g_lang ? "Downloading: %s  (%lld MiB)" : "Загрузка: %s  (%lld МиБ)",
+                            spbuf, got / (1024 * 1024));
+                        ui_status(st);
                     }
                 }
                 free(buf); fclose(fp);
@@ -1516,6 +1544,27 @@ static DWORD WINAPI dl_thread(LPVOID p) {
     return 0;
 }
 
+/* fetch one region's recovery list into the results table; returns count */
+static int fw_fetch_region(const char *codename, const char *region) {
+    g_res_count = 0; g_res_current = -1;
+    char url[256];
+    _snprintf(url, sizeof(url), "https://mirom.ezbox.idv.tw/en/phone/%s/roms-%s-stable/",
+              codename, region);
+    char *html = fetch_url_text(url);
+    if (!html) return 0;
+    static char urls[40][512];
+    int n = extract_recovery_urls(html, urls, 40);
+    free(html);
+    for (int i = 0; i < n && g_res_count < MAXRES; i++) {
+        url_version(urls[i], g_res_ver[g_res_count], 64);
+        strncpy(g_res_url[g_res_count], urls[i], 511); g_res_url[g_res_count][511] = 0;
+        g_res_count++;
+    }
+    for (int i = 0; i < g_res_count; i++)
+        if (g_dev_curver[0] && !_stricmp(g_res_ver[i], g_dev_curver)) { g_res_current = i; break; }
+    return g_res_count;
+}
+
 /* firmware search: resolve codename/region, list ezbox recovery ROMs into the
  * results table, then hand off to the UI to let the user choose. */
 static DWORD WINAPI fw_search_thread(LPVOID param) {
@@ -1576,27 +1625,18 @@ static DWORD WINAPI fw_search_thread(LPVOID param) {
         for (int j = 0; j < nr; j++) if (!strcmp(regions[j], fb[i])) dup = 1;
         if (!dup && nr < 6) regions[nr++] = fb[i]; }
 
-    g_res_count = 0; g_res_current = -1; g_res_sel = 0;
+    g_res_count = 0; g_res_current = -1; g_res_sel = 0; g_res_region[0] = 0;
+    strncpy(g_res_codename, codename, 63); g_res_codename[63] = 0;
     for (int ri = 0; ri < nr && g_res_count == 0; ri++) {
-        char url[256];
-        _snprintf(url, sizeof(url), "https://mirom.ezbox.idv.tw/en/phone/%s/roms-%s-stable/",
-                  codename, regions[ri]);
-        char *html = fetch_url_text(url);
-        if (!html) continue;
-        static char urls[40][512];
-        int n = extract_recovery_urls(html, urls, 40);
-        free(html);
+        int n = fw_fetch_region(codename, regions[ri]);
         if (n <= 0) continue;
-        for (int i = 0; i < n && g_res_count < MAXRES; i++) {
-            url_version(urls[i], g_res_ver[g_res_count], 64);
-            strncpy(g_res_url[g_res_count], urls[i], 511); g_res_url[g_res_count][511] = 0;
-            g_res_count++;
-        }
+        strncpy(g_res_region, regions[ri], 15); g_res_region[15] = 0;
         ui_log(g_lang ? "[%s] %d recovery ROMs (newest first):" : "[%s] %d recovery-прошивок (сначала новые):",
-               regions[ri], g_res_count);
+               regions[ri], n);
         for (int i = 0; i < g_res_count && i < 12; i++)
             ui_log("  %s%s", g_res_ver[i], i == 0 ? (g_lang ? "  (latest)" : "  (последняя)") : "");
     }
+    if (!g_res_region[0]) { strncpy(g_res_region, region, 15); g_res_region[15] = 0; }
 
     if (g_res_count == 0) {
         ui_log("%s", g_lang ? "Nothing found. Check the codename (e.g. agate) or open the site."
@@ -1963,6 +2003,19 @@ static void start_thread(LPTHREAD_START_ROUTINE fn) {
 }
 
 /* ============================================================ window proc */
+static void fill_results_listbox(HWND h) {
+    SendDlgItemMessageW(h, 201, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < g_res_count; i++) {
+        const char *tag = "";
+        if (i == g_res_current && i == 0) tag = g_lang ? "  (current, latest)" : "  (текущая, последняя)";
+        else if (i == g_res_current)      tag = g_lang ? "  (current)" : "  (текущая)";
+        else if (i == 0)                  tag = g_lang ? "  (latest)"  : "  (последняя)";
+        char line[160]; _snprintf(line, sizeof(line), "%s%s", g_res_ver[i], tag);
+        WCHAR *wl = u8towide(line); SendDlgItemMessageW(h, 201, LB_ADDSTRING, 0, (LPARAM)wl); free(wl);
+    }
+    SendDlgItemMessageW(h, 201, LB_SETCURSEL, (WPARAM)(g_res_current >= 0 ? g_res_current : 0), 0);
+}
+
 static INT_PTR CALLBACK ResultsDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     (void)l;
     switch (m) {
@@ -1970,26 +2023,36 @@ static INT_PTR CALLBACK ResultsDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         WCHAR t[192];
         Lw(S_FW_RESULTS_TITLE, t, 192); SetWindowTextW(h, t);
         Lw(S_FW_CHOOSE, t, 192); SetDlgItemTextW(h, 203, t);
+        Lw(S_FW_REGION, t, 192); SetDlgItemTextW(h, 206, t);
         Lw(S_FW_SOURCE, t, 192); SetDlgItemTextW(h, 204, t);
         Lw(S_FW_DL_BTN, t, 192); SetDlgItemTextW(h, IDOK, t);
         Lw(S_FW_CANCEL, t, 192); SetDlgItemTextW(h, IDCANCEL, t);
-        for (int i = 0; i < g_res_count; i++) {
-            const char *tag = "";
-            if (i == g_res_current && i == 0) tag = g_lang ? "  (current, latest)" : "  (текущая, последняя)";
-            else if (i == g_res_current)      tag = g_lang ? "  (current)" : "  (текущая)";
-            else if (i == 0)                  tag = g_lang ? "  (latest)"  : "  (последняя)";
-            char line[128]; _snprintf(line, sizeof(line), "%s%s", g_res_ver[i], tag);
-            WCHAR *wl = u8towide(line); SendDlgItemMessageW(h, 201, LB_ADDSTRING, 0, (LPARAM)wl); free(wl);
+        /* region combo */
+        int rsel = 0;
+        for (int i = 0; i < (int)(sizeof(REGIONS) / sizeof(REGIONS[0])); i++) {
+            WCHAR *wr = u8towide(REGIONS[i]); SendDlgItemMessageW(h, 205, CB_ADDSTRING, 0, (LPARAM)wr); free(wr);
+            if (!_stricmp(REGIONS[i], g_res_region)) rsel = i;
         }
-        SendDlgItemMessageW(h, 201, LB_SETCURSEL, (WPARAM)(g_res_sel < 0 ? 0 : g_res_sel), 0);
+        SendDlgItemMessageW(h, 205, CB_SETCURSEL, (WPARAM)rsel, 0);
+        /* mirror combo */
         for (int i = 0; i < (int)(sizeof(MIRRORS) / sizeof(MIRRORS[0])); i++) {
             WCHAR *wm = u8towide(MIRRORS[i]); SendDlgItemMessageW(h, 202, CB_ADDSTRING, 0, (LPARAM)wm); free(wm);
         }
         SendDlgItemMessageW(h, 202, CB_SETCURSEL, 0, 0);
+        fill_results_listbox(h);
         return TRUE;
     }
     case WM_COMMAND:
+        if (HIWORD(w) == CBN_SELCHANGE && LOWORD(w) == 205) {
+            int idx = (int)SendDlgItemMessageW(h, 205, CB_GETCURSEL, 0, 0); if (idx < 0) idx = 0;
+            int n = fw_fetch_region(g_res_codename, REGIONS[idx]);
+            strncpy(g_res_region, REGIONS[idx], 15); g_res_region[15] = 0;
+            fill_results_listbox(h);
+            ui_log(g_lang ? "[%s] %d recovery ROMs" : "[%s] %d recovery-прошивок", REGIONS[idx], n);
+            return TRUE;
+        }
         if (LOWORD(w) == IDOK) {
+            if (g_res_count <= 0) { EndDialog(h, 0); return TRUE; }
             int se = (int)SendDlgItemMessageW(h, 201, LB_GETCURSEL, 0, 0); if (se < 0) se = 0; g_res_sel = se;
             int mm = (int)SendDlgItemMessageW(h, 202, CB_GETCURSEL, 0, 0); if (mm < 0) mm = 0; g_mirror_sel = mm;
             EndDialog(h, 1); return TRUE;
