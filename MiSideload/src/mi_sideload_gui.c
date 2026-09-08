@@ -1255,18 +1255,21 @@ static void app_path(char *out, int n, const char *leaf);
 static volatile LONG g_dl_state = DL_IDLE;
 static char g_dl_url[1024] = {0};
 
-#define MAXRES 40
-static char g_res_ver[MAXRES][64];
-static char g_res_url[MAXRES][512];
+#define MAXRES 500
+static char g_res_ver[MAXRES][48];    /* version, e.g. OS1.0.19.0.UKWEUXM */
+static char g_res_file[MAXRES][160];  /* recovery zip filename */
+static char g_res_reg[MAXRES][24];    /* region label, e.g. eea/orange */
 static int  g_res_count = 0, g_res_current = -1, g_res_sel = 0, g_mirror_sel = 0;
 static char g_dev_curver[64] = {0};
+static char g_dev_region[24] = {0};
 static char g_res_codename[64] = {0};
-static char g_res_region[16] = {0};
-static const char *REGIONS[] = { "global","eea","ru","in","id","tw","cn","jp","kr" };
+static char g_regions[64][24]; static int g_region_count = 0, g_region_sel = 0;
+static int  g_filt[MAXRES], g_filt_count = 0;
 static const char *MIRRORS[] = {
-    "bigota.d.miui.com", "hugeota.d.miui.com", "cdnorg.d.miui.com",
-    "bn.d.miui.com", "airtel.bigota.d.miui.com"
+    "bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com",
+    "bigota.d.miui.com", "hugeota.d.miui.com", "cdnorg.d.miui.com", "bn.d.miui.com"
 };
+static const char *MIRROR_NAMES[] = { "OSS (aliyun)", "bigota", "hugeota", "cdnorg", "bn" };
 
 typedef struct { WCHAR host[256]; WCHAR path[1200]; INTERNET_PORT port; int secure; } url_t;
 
@@ -1511,29 +1514,22 @@ static const char *model_to_codename(const char *lo) {
 
 /* firmware search thread: resolve codename/region, list ezbox recovery ROMs, download pick */
 /* build a URL on the chosen mirror host (stored URLs are bigota.d.miui.com/...) */
-static void build_mirror_url(const char *url, int mi, char *out, int n) {
-    strncpy(out, url, n - 1); out[n - 1] = 0;
-    if (mi <= 0 || mi >= (int)(sizeof(MIRRORS) / sizeof(MIRRORS[0]))) return;
-    char *h = strstr(out, "bigota.d.miui.com");
-    if (!h) return;
-    char *slash = strchr(h, '/');
-    char tail[512]; strncpy(tail, slash ? slash : "", sizeof(tail) - 1); tail[sizeof(tail) - 1] = 0;
-    int pre = (int)(h - out);
-    char head[32]; if (pre >= (int)sizeof(head)) pre = sizeof(head) - 1;
-    memcpy(head, out, pre); head[pre] = 0;
-    _snprintf(out, n, "%s%s%s", head, MIRRORS[mi], tail);
+static void build_dl_url(int idx, int mi, char *out, int n) {
+    int m = (mi >= 0 && mi < (int)(sizeof(MIRRORS) / sizeof(MIRRORS[0]))) ? mi : 0;
+    _snprintf(out, n, "https://%s/%s/%s", MIRRORS[m], g_res_ver[idx], g_res_file[idx]);
 }
 
-/* normalize a region token, or NULL */
-static const char *region_norm(const char *t) {
-    static const char *r[][2] = {
-        {"global","global"},{"eea","eea"},{"europe","eea"},{"ru","ru"},{"russia","ru"},
-        {"in","in"},{"india","in"},{"id","id"},{"indonesia","id"},{"tw","tw"},{"taiwan","tw"},
-        {"cn","cn"},{"china","cn"},{"jp","jp"},{"japan","jp"},{"kr","kr"},{"korea","kr"},
-    };
-    for (int i = 0; i < (int)(sizeof(r) / sizeof(r[0])); i++)
-        if (!strcmp(t, r[i][0])) return r[i][1];
-    return NULL;
+/* read a JSON string starting at the opening quote; unescapes \/ \" ; returns ptr after */
+static const char *read_jstr(const char *p, char *out, int n) {
+    if (*p != '"') { out[0] = 0; return p; }
+    p++; int i = 0;
+    while (*p && *p != '"' && i < n - 1) {
+        if (*p == '\\' && p[1]) { p++; out[i++] = (*p == 'n') ? ' ' : *p; }
+        else out[i++] = *p;
+        p++;
+    }
+    out[i] = 0; if (*p == '"') p++;
+    return p;
 }
 
 /* download worker: pulls URL from g_dl_url */
@@ -1544,24 +1540,106 @@ static DWORD WINAPI dl_thread(LPVOID p) {
     return 0;
 }
 
-/* fetch one region's recovery list into the results table; returns count */
-static int fw_fetch_region(const char *codename, const char *region) {
-    g_res_count = 0; g_res_current = -1;
-    char url[256];
-    _snprintf(url, sizeof(url), "https://mirom.ezbox.idv.tw/en/phone/%s/roms-%s-stable/",
-              codename, region);
-    char *html = fetch_url_text(url);
-    if (!html) return 0;
-    static char urls[40][512];
-    int n = extract_recovery_urls(html, urls, 40);
-    free(html);
-    for (int i = 0; i < n && g_res_count < MAXRES; i++) {
-        url_version(urls[i], g_res_ver[g_res_count], 64);
-        strncpy(g_res_url[g_res_count], urls[i], 511); g_res_url[g_res_count][511] = 0;
-        g_res_count++;
+/* parse hub.miuier.com V3 device JSON -> results (region/carrier + version + recovery file) */
+static int parse_miuier_device(const char *json) {
+    g_res_count = 0;
+    const char *p = json;
+    char region[24] = "", carrier[24] = "", pend[48] = "";
+    for (;;) {
+        const char *pr = strstr(p, "\"region\":");
+        const char *pc = strstr(p, "\"carrier\":");
+        const char *pm = strstr(p, "\"miui\":");
+        const char *pv = strstr(p, "\"recovery\":");
+        const char *nx = NULL; int which = 0;
+        if (pr && (!nx || pr < nx)) { nx = pr; which = 1; }
+        if (pc && (!nx || pc < nx)) { nx = pc; which = 2; }
+        if (pm && (!nx || pm < nx)) { nx = pm; which = 3; }
+        if (pv && (!nx || pv < nx)) { nx = pv; which = 4; }
+        if (!nx) break;
+        const char *q = strchr(nx, ':'); if (!q) break; q++;
+        while (*q==' '||*q=='\n'||*q=='\r'||*q=='\t') q++;
+        if (which == 1) { p = read_jstr(q, region, sizeof(region)); }
+        else if (which == 2) { while (*q=='['||*q==' '||*q=='\n'||*q=='\r'||*q=='\t') q++;
+                               if (*q == '"') p = read_jstr(q, carrier, sizeof(carrier));
+                               else { carrier[0] = 0; p = q; } }
+        else if (which == 3) { p = read_jstr(q, pend, sizeof(pend)); }
+        else { char file[160]; p = read_jstr(q, file, sizeof(file));
+               if (pend[0] && g_res_count < MAXRES) {
+                   strncpy(g_res_ver[g_res_count], pend, 47); g_res_ver[g_res_count][47] = 0;
+                   strncpy(g_res_file[g_res_count], file, 159); g_res_file[g_res_count][159] = 0;
+                   if (carrier[0]) _snprintf(g_res_reg[g_res_count], 24, "%s/%s", region, carrier);
+                   else { strncpy(g_res_reg[g_res_count], region, 23); g_res_reg[g_res_count][23] = 0; }
+                   g_res_count++;
+               }
+               pend[0] = 0; }
     }
-    for (int i = 0; i < g_res_count; i++)
-        if (g_dev_curver[0] && !_stricmp(g_res_ver[i], g_dev_curver)) { g_res_current = i; break; }
+    return g_res_count;
+}
+
+/* resolve a model name (or codename) to a codename via hub index.json */
+static int resolve_model(const char *qlo, char *out, int n) {
+    char *idx = fetch_url_text("https://api.miuier.com/api/v3/index.json");
+    if (!idx) return 0;
+    int found = 0; char best[64] = "";
+    const char *p = idx;
+    while ((p = strstr(p, "\"device\":")) != NULL) {
+        const char *q = strchr(p, ':'); q++; while (*q==' '||*q=='\n'||*q=='\r'||*q=='\t') q++;
+        char cn[64]; read_jstr(q, cn, sizeof(cn));
+        const char *nd = strstr(p + 1, "\"device\":");
+        const char *en = strstr(p, "\"en\":");
+        if (en && (!nd || en < nd)) {
+            const char *q2 = strchr(en, ':'); q2++; while (*q2==' '||*q2=='\n'||*q2=='\r'||*q2=='\t') q2++;
+            char model[96]; read_jstr(q2, model, sizeof(model));
+            char ml[96]; strncpy(ml, model, 95); ml[95] = 0; for (char *x = ml; *x; x++) *x = (char)tolower((unsigned char)*x);
+            char cl[64]; strncpy(cl, cn, 63); cl[63] = 0; for (char *x = cl; *x; x++) *x = (char)tolower((unsigned char)*x);
+            if (!strcmp(qlo, cl)) { strncpy(out, cn, n - 1); out[n - 1] = 0; found = 1; break; }
+            if (!best[0] && (strstr(ml, qlo) || (strlen(qlo) >= 3 && strstr(qlo, ml)))) { strncpy(best, cn, 63); best[63] = 0; }
+        }
+        p += 1;
+    }
+    if (!found && best[0]) { strncpy(out, best, n - 1); out[n - 1] = 0; found = 1; }
+    free(idx);
+    return found;
+}
+
+/* build unique region-label list from results */
+static void build_regions(void) {
+    g_region_count = 0;
+    for (int i = 0; i < g_res_count; i++) {
+        int dup = 0;
+        for (int j = 0; j < g_region_count; j++) if (!strcmp(g_regions[j], g_res_reg[i])) { dup = 1; break; }
+        if (!dup && g_region_count < 64) { strncpy(g_regions[g_region_count], g_res_reg[i], 23);
+                                           g_regions[g_region_count][23] = 0; g_region_count++; }
+    }
+}
+
+/* fetch all ROMs for a codename: hub.miuier.com (all regions/carriers), ezbox fallback */
+static int fw_fetch(const char *codename) {
+    g_res_count = 0;
+    char url[256];
+    _snprintf(url, sizeof(url), "https://api.miuier.com/api/v3/devices/%s.json", codename);
+    char *j = fetch_url_text(url);
+    if (j) { parse_miuier_device(j); free(j); }
+    if (g_res_count > 0) {
+        ui_log(g_lang ? "hub.miuier.com: %d recovery ROMs (all regions/carriers)"
+                      : "hub.miuier.com: %d recovery-прошивок (все регионы/операторы)", g_res_count);
+        return g_res_count;
+    }
+    ui_log("%s", g_lang ? "hub empty — trying ezbox…" : "hub пуст — пробую ezbox…");
+    const char *regs[] = { "global", "eea", "ru", "in", "tw", "id" };
+    for (int i = 0; i < 6; i++) {
+        char u[256];
+        _snprintf(u, sizeof(u), "https://mirom.ezbox.idv.tw/en/phone/%s/roms-%s-stable/", codename, regs[i]);
+        char *h = fetch_url_text(u); if (!h) continue;
+        static char urls[40][512]; int mn = extract_recovery_urls(h, urls, 40); free(h);
+        for (int k = 0; k < mn && g_res_count < MAXRES; k++) {
+            url_version(urls[k], g_res_ver[g_res_count], 48);
+            url_basename(urls[k], g_res_file[g_res_count], 160);
+            strncpy(g_res_reg[g_res_count], regs[i], 23); g_res_reg[g_res_count][23] = 0;
+            g_res_count++;
+        }
+    }
+    if (g_res_count > 0) ui_log(g_lang ? "ezbox: %d recovery ROMs" : "ezbox: %d recovery-прошивок", g_res_count);
     return g_res_count;
 }
 
@@ -1571,8 +1649,8 @@ static DWORD WINAPI fw_search_thread(LPVOID param) {
     char q[160] = {0};
     if (param) { strncpy(q, (char *)param, 159); free(param); }
 
-    char codename[64] = {0}, region[16] = {0}, target_ver[64] = {0}; int want_exact = 0;
-    g_dev_curver[0] = 0;
+    char codename[64] = {0}, target_ver[64] = {0}; int want_exact = 0;
+    g_dev_curver[0] = 0; g_dev_region[0] = 0;
 
     /* device gives codename + region + current version */
     { adb_dev d; char err[128], ban[512];
@@ -1583,78 +1661,69 @@ static DWORD WINAPI fw_search_thread(LPVOID param) {
           int i = 0; for (; dev[i] && dev[i] != '_' && i < 63; i++) codename[i] = dev[i]; codename[i] = 0;
           char lo[64]; strncpy(lo, dev, 63); lo[63] = 0;
           for (char *p = lo; *p; p++) *p = (char)tolower((unsigned char)*p);
-          if (strstr(lo, "eea")) strcpy(region, "eea");
-          else if (strstr(lo, "russia") || strstr(lo, "_ru")) strcpy(region, "ru");
-          else if (strstr(lo, "india")  || strstr(lo, "_in")) strcpy(region, "in");
-          else if (strstr(lo, "taiwan") || strstr(lo, "_tw")) strcpy(region, "tw");
-          else if (strstr(lo, "global")) strcpy(region, "global");
+          if (strstr(lo, "eea")) strcpy(g_dev_region, "eea");
+          else if (strstr(lo, "russia") || strstr(lo, "_ru")) strcpy(g_dev_region, "ru");
+          else if (strstr(lo, "india")  || strstr(lo, "_in")) strcpy(g_dev_region, "in");
+          else if (strstr(lo, "taiwan") || strstr(lo, "_tw")) strcpy(g_dev_region, "tw");
+          else if (strstr(lo, "global")) strcpy(g_dev_region, "global");
       }
     }
 
-    /* query can override codename / region / exact version */
+    /* query can override codename / exact version */
     if (q[0]) {
         char lo[160]; strncpy(lo, q, 159); lo[159] = 0;
         for (char *p = lo; *p; p++) *p = (char)tolower((unsigned char)*p);
-        const char *mc = model_to_codename(lo);
-        if (mc) { strncpy(codename, mc, 63); codename[63] = 0; }
-        char tmp[160]; strncpy(tmp, lo, 159); tmp[159] = 0;
-        char cand[64] = "";
-        for (char *tok = strtok(tmp, " "); tok; tok = strtok(NULL, " ")) {
-            const char *rg = region_norm(tok);
-            int isver = ((tok[0] == 'v' || !_strnicmp(tok, "os", 2)) && strchr(tok, '.'));
-            if (rg) { strncpy(region, rg, 15); region[15] = 0; }
-            else if (isver) { strncpy(target_ver, tok, 63); target_ver[63] = 0; want_exact = 1;
-                              for (char *p = target_ver; *p; p++) *p = (char)toupper((unsigned char)*p); }
-            else if (!cand[0]) { strncpy(cand, tok, 63); cand[63] = 0; }
+        int isver = ((q[0] == 'V' || q[0] == 'v' || !_strnicmp(q, "OS", 2)) && strchr(q, '.'));
+        if (isver) { strncpy(target_ver, q, 63); target_ver[63] = 0; want_exact = 1;
+                     for (char *p = target_ver; *p; p++) *p = (char)toupper((unsigned char)*p); }
+        else {
+            char cn[64] = "";
+            if (resolve_model(lo, cn, sizeof(cn)) || (model_to_codename(lo) && strcpy(cn, model_to_codename(lo)))) {
+                strncpy(codename, cn, 63); codename[63] = 0;
+            } else {
+                int i = 0; for (; lo[i] && lo[i] != ' ' && i < 63; i++) codename[i] = lo[i]; codename[i] = 0;
+            }
         }
-        if (!mc && cand[0]) { strncpy(codename, cand, 63); codename[63] = 0; }
     }
-    if (!region[0]) strcpy(region, "global");
+
     if (!codename[0]) {
-        ui_log("%s", g_lang ? "No device/codename. Connect the phone or type a codename (e.g. agate)."
-                            : "Нет устройства/кодового имени. Подключите телефон или введите кодовое имя (напр. agate).");
+        ui_log("%s", g_lang ? "No device/codename. Connect the phone or type a model/codename (e.g. Xiaomi 11T / agate)."
+                            : "Нет устройства/кодового имени. Подключите телефон или введите модель/кодовое имя (напр. Xiaomi 11T / agate).");
         g_res_count = 0; goto post;
     }
-
-    ui_log(g_lang ? "Searching firmware: codename=%s, region=%s"
-                  : "Поиск прошивки: кодовое имя=%s, регион=%s", codename, region);
-
-    const char *regions[6]; int nr = 0; regions[nr++] = region;
-    const char *fb[] = { "global", "eea", "ru", "in", "tw" };
-    for (int i = 0; i < 5; i++) { int dup = 0;
-        for (int j = 0; j < nr; j++) if (!strcmp(regions[j], fb[i])) dup = 1;
-        if (!dup && nr < 6) regions[nr++] = fb[i]; }
-
-    g_res_count = 0; g_res_current = -1; g_res_sel = 0; g_res_region[0] = 0;
     strncpy(g_res_codename, codename, 63); g_res_codename[63] = 0;
-    for (int ri = 0; ri < nr && g_res_count == 0; ri++) {
-        int n = fw_fetch_region(codename, regions[ri]);
-        if (n <= 0) continue;
-        strncpy(g_res_region, regions[ri], 15); g_res_region[15] = 0;
-        ui_log(g_lang ? "[%s] %d recovery ROMs (newest first):" : "[%s] %d recovery-прошивок (сначала новые):",
-               regions[ri], n);
-        for (int i = 0; i < g_res_count && i < 12; i++)
-            ui_log("  %s%s", g_res_ver[i], i == 0 ? (g_lang ? "  (latest)" : "  (последняя)") : "");
-    }
-    if (!g_res_region[0]) { strncpy(g_res_region, region, 15); g_res_region[15] = 0; }
+    ui_log(g_lang ? "Searching firmware: codename=%s" : "Поиск прошивки: кодовое имя=%s", codename);
 
-    if (g_res_count == 0) {
+    if (fw_fetch(codename) == 0) {
         ui_log("%s", g_lang ? "Nothing found. Check the codename (e.g. agate) or open the site."
                             : "Ничего не найдено. Проверьте кодовое имя (напр. agate) или откройте сайт.");
         goto post;
     }
-    for (int i = 0; i < g_res_count; i++)
-        if (g_dev_curver[0] && !_stricmp(g_res_ver[i], g_dev_curver)) { g_res_current = i; break; }
-    if (want_exact)
-        for (int i = 0; i < g_res_count; i++)
-            if (!_stricmp(g_res_ver[i], target_ver)) { g_res_current = i; break; }
-    g_res_sel = (g_res_current >= 0) ? g_res_current : 0;
+
+    /* current / requested version match */
+    g_res_current = -1;
+    if (want_exact) {
+        for (int i = 0; i < g_res_count; i++) if (!_stricmp(g_res_ver[i], target_ver)) { g_res_current = i; break; }
+    }
+    if (g_res_current < 0)
+        for (int i = 0; i < g_res_count; i++) if (g_dev_curver[0] && !_stricmp(g_res_ver[i], g_dev_curver)) { g_res_current = i; break; }
+
+    build_regions();
+    /* default region: current's region, else device region prefix, else first */
+    g_region_sel = 0;
+    if (g_res_current >= 0) {
+        for (int j = 0; j < g_region_count; j++) if (!strcmp(g_regions[j], g_res_reg[g_res_current])) { g_region_sel = j; break; }
+    } else if (g_dev_region[0]) {
+        for (int j = 0; j < g_region_count; j++)
+            if (!_strnicmp(g_regions[j], g_dev_region, strlen(g_dev_region))) { g_region_sel = j; break; }
+    }
     if (g_res_current >= 0)
-        ui_log(g_lang ? "Match in list: %s (preselected)" : "Совпадение в списке: %s (выбрано по умолчанию)",
-               g_res_ver[g_res_current]);
+        ui_log(g_lang ? "Current/requested %s found (region %s) — preselected."
+                      : "Текущая/запрошенная %s найдена (регион %s) — выбрана по умолчанию.",
+               g_res_ver[g_res_current], g_res_reg[g_res_current]);
     else if (g_dev_curver[0])
-        ui_log(g_lang ? "Current build %s not in this region list — latest preselected."
-                      : "Текущей сборки %s нет в списке региона — выбрана последняя.", g_dev_curver);
+        ui_log(g_lang ? "Current build %s not in data — latest preselected."
+                      : "Текущей сборки %s нет в данных — выбрана последняя.", g_dev_curver);
 
 post:
     PostMessage(g_main, WM_APP_RESULTS, 0, 0);
@@ -1908,11 +1977,11 @@ static void about_show(HWND owner) {
     static const WCHAR *ru =
         L"Официальная OTA-прошивка Xiaomi через режим MiAssistant.\n"
         L"Без разблокировки загрузчика. Только официальные подписанные прошивки.\n\n"
-        L"© 2026 (Mansi)  Github — <a href=\"" APP_GITHUB_URL L"\">github.com/slfl/Random-Scripts</a>";
+        L"© 2026 (Mansi)  <a href=\"" APP_GITHUB_URL L"\">Github</a>";
     static const WCHAR *en =
         L"Official Xiaomi OTA flashing via MiAssistant mode.\n"
         L"No bootloader unlock. Official signed firmware only.\n\n"
-        L"© 2026 (Mansi)  Github — <a href=\"" APP_GITHUB_URL L"\">github.com/slfl/Random-Scripts</a>";
+        L"© 2026 (Mansi)  <a href=\"" APP_GITHUB_URL L"\">Github</a>";
     TASKDIALOGCONFIG c; memset(&c, 0, sizeof(c));
     c.cbSize = sizeof(c);
     c.hwndParent = owner;
@@ -2005,15 +2074,25 @@ static void start_thread(LPTHREAD_START_ROUTINE fn) {
 /* ============================================================ window proc */
 static void fill_results_listbox(HWND h) {
     SendDlgItemMessageW(h, 201, LB_RESETCONTENT, 0, 0);
-    for (int i = 0; i < g_res_count; i++) {
+    int cursel = 0;
+    for (int i = 0; i < g_filt_count; i++) {
+        int gi = g_filt[i];
         const char *tag = "";
-        if (i == g_res_current && i == 0) tag = g_lang ? "  (current, latest)" : "  (текущая, последняя)";
-        else if (i == g_res_current)      tag = g_lang ? "  (current)" : "  (текущая)";
-        else if (i == 0)                  tag = g_lang ? "  (latest)"  : "  (последняя)";
-        char line[160]; _snprintf(line, sizeof(line), "%s%s", g_res_ver[i], tag);
+        if (gi == g_res_current && i == 0) tag = g_lang ? "  (current, latest)" : "  (текущая, последняя)";
+        else if (gi == g_res_current)      { tag = g_lang ? "  (current)" : "  (текущая)"; cursel = i; }
+        else if (i == 0)                   tag = g_lang ? "  (latest)"  : "  (последняя)";
+        if (gi == g_res_current) cursel = i;
+        char line[200]; _snprintf(line, sizeof(line), "%s%s", g_res_ver[gi], tag);
         WCHAR *wl = u8towide(line); SendDlgItemMessageW(h, 201, LB_ADDSTRING, 0, (LPARAM)wl); free(wl);
     }
-    SendDlgItemMessageW(h, 201, LB_SETCURSEL, (WPARAM)(g_res_current >= 0 ? g_res_current : 0), 0);
+    SendDlgItemMessageW(h, 201, LB_SETCURSEL, (WPARAM)cursel, 0);
+}
+
+static void apply_region_filter(int regidx) {
+    g_filt_count = 0;
+    if (regidx < 0 || regidx >= g_region_count) return;
+    for (int i = 0; i < g_res_count && g_filt_count < MAXRES; i++)
+        if (!strcmp(g_res_reg[i], g_regions[regidx])) g_filt[g_filt_count++] = i;
 }
 
 static INT_PTR CALLBACK ResultsDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2027,33 +2106,29 @@ static INT_PTR CALLBACK ResultsDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Lw(S_FW_SOURCE, t, 192); SetDlgItemTextW(h, 204, t);
         Lw(S_FW_DL_BTN, t, 192); SetDlgItemTextW(h, IDOK, t);
         Lw(S_FW_CANCEL, t, 192); SetDlgItemTextW(h, IDCANCEL, t);
-        /* region combo */
-        int rsel = 0;
-        for (int i = 0; i < (int)(sizeof(REGIONS) / sizeof(REGIONS[0])); i++) {
-            WCHAR *wr = u8towide(REGIONS[i]); SendDlgItemMessageW(h, 205, CB_ADDSTRING, 0, (LPARAM)wr); free(wr);
-            if (!_stricmp(REGIONS[i], g_res_region)) rsel = i;
+        for (int i = 0; i < g_region_count; i++) {
+            WCHAR *wr = u8towide(g_regions[i]); SendDlgItemMessageW(h, 205, CB_ADDSTRING, 0, (LPARAM)wr); free(wr);
         }
-        SendDlgItemMessageW(h, 205, CB_SETCURSEL, (WPARAM)rsel, 0);
-        /* mirror combo */
-        for (int i = 0; i < (int)(sizeof(MIRRORS) / sizeof(MIRRORS[0])); i++) {
-            WCHAR *wm = u8towide(MIRRORS[i]); SendDlgItemMessageW(h, 202, CB_ADDSTRING, 0, (LPARAM)wm); free(wm);
+        SendDlgItemMessageW(h, 205, CB_SETCURSEL, (WPARAM)g_region_sel, 0);
+        for (int i = 0; i < (int)(sizeof(MIRROR_NAMES) / sizeof(MIRROR_NAMES[0])); i++) {
+            WCHAR *wm = u8towide(MIRROR_NAMES[i]); SendDlgItemMessageW(h, 202, CB_ADDSTRING, 0, (LPARAM)wm); free(wm);
         }
         SendDlgItemMessageW(h, 202, CB_SETCURSEL, 0, 0);
+        apply_region_filter(g_region_sel);
         fill_results_listbox(h);
         return TRUE;
     }
     case WM_COMMAND:
         if (HIWORD(w) == CBN_SELCHANGE && LOWORD(w) == 205) {
-            int idx = (int)SendDlgItemMessageW(h, 205, CB_GETCURSEL, 0, 0); if (idx < 0) idx = 0;
-            int n = fw_fetch_region(g_res_codename, REGIONS[idx]);
-            strncpy(g_res_region, REGIONS[idx], 15); g_res_region[15] = 0;
+            g_region_sel = (int)SendDlgItemMessageW(h, 205, CB_GETCURSEL, 0, 0); if (g_region_sel < 0) g_region_sel = 0;
+            apply_region_filter(g_region_sel);
             fill_results_listbox(h);
-            ui_log(g_lang ? "[%s] %d recovery ROMs" : "[%s] %d recovery-прошивок", REGIONS[idx], n);
             return TRUE;
         }
         if (LOWORD(w) == IDOK) {
-            if (g_res_count <= 0) { EndDialog(h, 0); return TRUE; }
-            int se = (int)SendDlgItemMessageW(h, 201, LB_GETCURSEL, 0, 0); if (se < 0) se = 0; g_res_sel = se;
+            if (g_filt_count <= 0) { EndDialog(h, 0); return TRUE; }
+            int se = (int)SendDlgItemMessageW(h, 201, LB_GETCURSEL, 0, 0); if (se < 0) se = 0;
+            g_res_sel = g_filt[se];
             int mm = (int)SendDlgItemMessageW(h, 202, CB_GETCURSEL, 0, 0); if (mm < 0) mm = 0; g_mirror_sel = mm;
             EndDialog(h, 1); return TRUE;
         }
@@ -2220,10 +2295,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         set_busy(0);
         if (g_res_count > 0 &&
             DialogBoxParamW(GetModuleHandle(NULL), MAKEINTRESOURCEW(IDD_RESULTS), hwnd, ResultsDlgProc, 0) == 1) {
-            char url[600]; build_mirror_url(g_res_url[g_res_sel], g_mirror_sel, url, sizeof(url));
+            char url[700]; build_dl_url(g_res_sel, g_mirror_sel, url, sizeof(url));
             strncpy(g_dl_url, url, sizeof(g_dl_url) - 1); g_dl_url[sizeof(g_dl_url) - 1] = 0;
-            ui_log(g_lang ? "Selected %s via %s" : "Выбрано %s через %s",
-                   g_res_ver[g_res_sel], MIRRORS[g_mirror_sel]);
+            ui_log(g_lang ? "Selected %s [%s] via %s" : "Выбрано %s [%s] через %s",
+                   g_res_ver[g_res_sel], g_res_reg[g_res_sel], MIRROR_NAMES[g_mirror_sel]);
             set_busy(1);
             CloseHandle(CreateThread(NULL, 0, dl_thread, NULL, 0, NULL));
         }
