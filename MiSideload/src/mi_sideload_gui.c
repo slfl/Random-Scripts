@@ -844,6 +844,25 @@ static int json_find_int(const char *json, const char *key, int *out) {
     return 1;
 }
 
+/* find a string JSON field ("message":"..."); returns 1 if found and non-empty */
+static int json_find_str(const char *json, const char *key, char *out, int n) {
+    char pat[64]; _snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *k = strstr(json, pat);
+    if (!k) { out[0] = 0; return 0; }
+    const char *p = strchr(k + strlen(pat), ':');
+    if (!p) { out[0] = 0; return 0; }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') { out[0] = 0; return 0; }
+    p++; int i = 0;
+    while (*p && *p != '"' && i < n - 1) {
+        if (*p == '\\' && p[1]) { p++; out[i++] = *p; } else out[i++] = *p;
+        p++;
+    }
+    out[i] = 0;
+    return out[0] != 0;
+}
+
 /* trim to the outermost { ... } (strip any pre/post garbage after decrypt) */
 static void json_trim_braces(char *s) {
     char *a = strchr(s, '{');
@@ -947,9 +966,15 @@ static int get_validate(const dev_info *fi, const char *fw,
 
     char *val = json_find_validate((char *)plain);
     if (!val) {
-        _snprintf(errbuf, errlen,
-            "server returned no Validate token (package not official for this "
-            "device/version, or a data wipe is required)");
+        char msg[256];
+        if (json_find_str((char *)plain, "message", msg, sizeof(msg)))
+            ui_log(g_lang ? "  server message: %s" : "  сообщение сервера: %s", msg);
+        ui_log(g_lang ? "  server reply: %.480s" : "  ответ сервера: %.480s", (char *)plain);
+        _snprintf(errbuf, errlen, "%s", g_lang
+            ? "server issued no Validate token — likely a downgrade/blocked target, a "
+              "wrong region/variant, or a corrupt zip (md5 not recognised)."
+            : "сервер не выдал токен Validate — вероятно даунгрейд/запрещённая цель, "
+              "не тот регион/вариант, или битый zip (md5 не распознан).");
         free(plain); return -1;
     }
     int erase = 0;
